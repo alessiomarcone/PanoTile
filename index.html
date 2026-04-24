@@ -104,6 +104,32 @@
             </div>
         </div>
 
+        <!-- BLOCK PATTERN -->
+        <div class="section">
+            <div class="section-title">BLOCK PATTERN</div>
+            <div class="field">
+                <div class="field-label">Pattern</div>
+                <select class="field-select" id="selectPattern" disabled>
+                    <option value="none">None</option>
+                    <option value="checkerboard">Checkerboard</option>
+                    <option value="random">Random %</option>
+                    <option value="borders">Borders</option>
+                    <option value="center">Center</option>
+                </select>
+            </div>
+            <div class="slider-row" id="patternAmtRow" style="display: none;">
+                <div class="slider-head">
+                    <span class="field-label">Amount</span>
+                    <span class="slider-value"><span id="patternAmtValue">50</span>%</span>
+                </div>
+                <input type="range" class="slider" id="inputPatternAmt" min="0" max="100" step="1" value="50" disabled>
+            </div>
+            <div class="btn-grid-2">
+                <button class="btn" id="btnPatternApply" disabled>Apply</button>
+                <button class="btn" id="btnPatternClear" disabled>Clear all</button>
+            </div>
+        </div>
+
         <!-- EXPORT -->
         <div class="section spacer">
             <div class="section-title">EXPORT</div>

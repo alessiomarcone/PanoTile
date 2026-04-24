@@ -88,6 +88,12 @@ const el = {
     shuffleAmtRow: $('shuffleAmtRow'),
     inputShuffleAmt: $('inputShuffleAmt'),
     shuffleAmtValue: $('shuffleAmtValue'),
+    selectPattern: $('selectPattern'),
+    patternAmtRow: $('patternAmtRow'),
+    inputPatternAmt: $('inputPatternAmt'),
+    patternAmtValue: $('patternAmtValue'),
+    btnPatternApply: $('btnPatternApply'),
+    btnPatternClear: $('btnPatternClear'),
     btnBrowse: $('btnBrowse'),
     emptyState: $('emptyState'),
     loadingOverlay: $('loadingOverlay'),
@@ -1374,7 +1380,8 @@ function enableControls() {
     const ctrls = [
         el.inputCols, el.inputRows, el.checkSquare, el.checkGrid, el.checkLoop,
         el.selectRes, el.selectFps, el.inputDuration, el.selectMode,
-        el.btnGenerate, el.btnExportPng, el.btnExportVideo
+        el.btnGenerate, el.btnExportPng, el.btnExportVideo,
+        el.selectPattern, el.btnPatternClear
     ];
     ctrls.forEach(c => c.disabled = false);
     if (el.checkSquare.checked) el.inputRows.disabled = true;
@@ -1472,6 +1479,75 @@ el.checkGrid.onchange = () => renderAll();
         input.value = v;
     });
 });
+
+/* ==========================================================
+   BLOCK PATTERN
+   ========================================================== */
+
+function applyPattern() {
+    const pattern = el.selectPattern.value;
+    if (pattern === 'none') return;
+
+    const cols = parseInt(el.inputCols.value);
+    const rows = parseInt(el.inputRows.value);
+
+    state.tiles.forEach(t => { t.isPinned = false; });
+
+    switch (pattern) {
+        case 'checkerboard':
+            state.tiles.forEach((t, i) => {
+                const col = i % cols, row = Math.floor(i / cols);
+                t.isPinned = (row + col) % 2 === 0;
+            });
+            break;
+
+        case 'random': {
+            const pct = parseInt(el.inputPatternAmt.value) / 100;
+            state.tiles.forEach(t => { t.isPinned = Math.random() < pct; });
+            break;
+        }
+
+        case 'borders':
+            state.tiles.forEach((t, i) => {
+                const col = i % cols, row = Math.floor(i / cols);
+                t.isPinned = row === 0 || row === rows - 1 || col === 0 || col === cols - 1;
+            });
+            break;
+
+        case 'center': {
+            const r0 = Math.floor(rows / 4), r1 = Math.ceil(3 * rows / 4);
+            const c0 = Math.floor(cols / 4), c1 = Math.ceil(3 * cols / 4);
+            state.tiles.forEach((t, i) => {
+                const col = i % cols, row = Math.floor(i / cols);
+                t.isPinned = row >= r0 && row < r1 && col >= c0 && col < c1;
+            });
+            break;
+        }
+    }
+
+    renderAll();
+    updateStatus();
+}
+
+function clearAllPins() {
+    state.tiles.forEach(t => { t.isPinned = false; });
+    renderAll();
+    updateStatus();
+}
+
+el.selectPattern.addEventListener('change', () => {
+    const p = el.selectPattern.value;
+    el.patternAmtRow.style.display = p === 'random' ? '' : 'none';
+    el.btnPatternApply.disabled = p === 'none';
+    if (p === 'random') el.inputPatternAmt.disabled = false;
+});
+
+el.inputPatternAmt.addEventListener('input', () => {
+    el.patternAmtValue.innerText = el.inputPatternAmt.value;
+});
+
+el.btnPatternApply.onclick = applyPattern;
+el.btnPatternClear.onclick = clearAllPins;
 
 /* ==========================================================
    KEYBOARD SHORTCUTS
