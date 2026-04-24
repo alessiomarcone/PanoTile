@@ -4,11 +4,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" type="image/png" href="../img/favicon/favicon-96x96.png" sizes="96x96" />
-    <link rel="icon" type="image/svg+xml" href="../img/favicon/favicon.svg" />
-    <link rel="shortcut icon" href="../img/favicon/favicon.ico" />
-    <link rel="apple-touch-icon" sizes="180x180" href="../img/favicon/apple-touch-icon.png" />
-    <link rel="manifest" href="../img/favicon/site.webmanifest" />
+    <link rel="icon" type="image/png" href="img/favicon/favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="img/favicon/favicon.svg" />
+    <link rel="shortcut icon" href="img/favicon/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="img/favicon/apple-touch-icon.png" />
+    <link rel="manifest" href="img/favicon/site.webmanifest" />
     <title>PanoTile — Time-displacement video editor</title>
     <style>
         :root {
@@ -916,14 +916,27 @@
             <button class="btn" id="btnGenerate" disabled>Regenerate grid</button>
         </div>
 
-        <!-- PRESETS -->
+        <!-- MODE -->
         <div class="section">
-            <div class="section-title">TIME PRESETS</div>
-            <div class="btn-grid-2">
-                <button class="btn btn-preset automation" id="btnLinearLR" disabled>→ Linear</button>
-                <button class="btn btn-preset automation" id="btnLinearRL" disabled>← Linear</button>
-                <button class="btn btn-preset automation" id="btnShuffle" disabled>Shuffle</button>
-                <button class="btn btn-preset automation" id="btnReset" disabled>Reset</button>
+            <div class="section-title">MODE</div>
+            <div class="field">
+                <div class="field-label">Animation mode</div>
+                <select class="field-select" id="selectMode" disabled>
+                    <option value="static">Static</option>
+                    <option value="linear-lr">Linear →</option>
+                    <option value="linear-rl">Linear ←</option>
+                    <option value="temporal-shuffle">Shuffle (temporal)</option>
+                    <option value="drunk">Drunk walk</option>
+                    <option value="perlin-flow">Perlin flow</option>
+                    <option value="spatial">Spatial shuffle</option>
+                </select>
+            </div>
+            <div class="slider-row" id="shuffleAmtRow" style="display: none;">
+                <div class="slider-head">
+                    <span class="field-label">Shuffle amount</span>
+                    <span class="slider-value" id="shuffleAmtValue">5</span>
+                </div>
+                <input type="range" class="slider" id="inputShuffleAmt" min="0" max="10" step="1" value="5" disabled>
             </div>
         </div>
 
@@ -1078,6 +1091,16 @@
             ready: false
         };
 
+        const anim = {
+            mode: 'static',
+            raf: null,
+            lastNow: 0,
+            elapsed: 0,
+            tileOffsets: [],
+            tilePhases: [],
+            _loop: null,
+        };
+
         /* ==========================================================
            DOM
            ========================================================== */
@@ -1116,10 +1139,10 @@
             btnGenerate: $('btnGenerate'),
             btnExportPng: $('btnExportPng'),
             btnExportVideo: $('btnExportVideo'),
-            btnLinearLR: $('btnLinearLR'),
-            btnLinearRL: $('btnLinearRL'),
-            btnShuffle: $('btnShuffle'),
-            btnReset: $('btnReset'),
+            selectMode: $('selectMode'),
+            shuffleAmtRow: $('shuffleAmtRow'),
+            inputShuffleAmt: $('inputShuffleAmt'),
+            shuffleAmtValue: $('shuffleAmtValue'),
             btnBrowse: $('btnBrowse'),
             emptyState: $('emptyState'),
             loadingOverlay: $('loadingOverlay'),
@@ -1588,6 +1611,8 @@
                         h: cH / rows,
                         srcX: oX + c * sW,
                         srcY: oY + r * sH,
+                        origSrcX: oX + c * sW,
+                        origSrcY: oY + r * sH,
                         srcW: sW,
                         srcH: sH,
                         frameIndex: 0,
@@ -1596,7 +1621,7 @@
                     });
                 }
             }
-            renderAll();
+            setMode(anim.mode);
             updateStatus();
         }
 
@@ -1725,6 +1750,7 @@
         canvas.addEventListener('pointerdown', (e) => {
             // Left mouse button, primary touch, or pen — ignore middle/right
             if (e.pointerType === 'mouse' && e.button !== 0) return;
+            if (anim.mode !== 'static') return;
             const t = tileAtEvent(e);
             if (t && !t.isPinned) {
                 state.activeTile = t;
@@ -1832,44 +1858,173 @@
         });
 
         /* ==========================================================
-           TIME PRESETS
+           NOISE UTILITIES
            ========================================================== */
 
-        function presetLinear(reverse) {
+        function _seededRng(seed) {
+            let s = seed | 0;
+            return () => {
+                s = (Math.imul(s, 1664525) + 1013904223) | 0;
+                return (s >>> 0) / 4294967296;
+            };
+        }
+
+        function _sstep(t) { return t * t * (3 - 2 * t); }
+
+        function _ihash3(x, y, z) {
+            let h = ((x * 1619 + y * 31337 + z * 52711 + 1013904223) | 0);
+            h = (Math.imul(h ^ (h >>> 13), 1664525) + 1013904223) | 0;
+            return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+        }
+
+        function valueNoise3(x, y, z) {
+            const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+            const fx = _sstep(x - xi), fy = _sstep(y - yi), fz = _sstep(z - zi);
+            const L = (a, b, t) => a + (b - a) * t;
+            const v = (dx, dy, dz) => _ihash3(xi + dx, yi + dy, zi + dz);
+            return L(
+                L(L(v(0,0,0), v(1,0,0), fx), L(v(0,1,0), v(1,1,0), fx), fy),
+                L(L(v(0,0,1), v(1,0,1), fx), L(v(0,1,1), v(1,1,1), fx), fy),
+                fz
+            );
+        }
+
+        /* ==========================================================
+           ANIMATION ENGINE
+           ========================================================== */
+
+        function setMode(mode) {
+            if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
+
+            if (anim.mode === 'spatial' && mode !== 'spatial') {
+                state.tiles.forEach(t => { t.srcX = t.origSrcX; t.srcY = t.origSrcY; });
+            }
+
+            anim.mode = mode;
+            if (el.shuffleAmtRow) el.shuffleAmtRow.style.display = mode === 'spatial' ? '' : 'none';
+
+            if (mode === 'static') {
+                canvas.style.cursor = 'ew-resize';
+                renderAll();
+                return;
+            }
+
+            canvas.style.cursor = 'default';
+
+            if (mode === 'spatial') {
+                el.inputShuffleAmt.disabled = false;
+                if (state.ready) applySpatialShuffle(parseInt(el.inputShuffleAmt.value));
+                return;
+            }
+            el.inputShuffleAmt.disabled = true;
+
+            if (!state.ready) return;
+
             const n = state.tiles.length;
-            const unpinned = state.tiles.filter(t => !t.isPinned);
-            const count = unpinned.length;
+            const N = state.totalFrames;
+            const rng = _seededRng(Date.now() | 0);
+            anim.tileOffsets = Array.from({length: n}, () => rng());
+            anim.tilePhases = anim.tileOffsets.map(r => r * N);
+            anim.elapsed = 0;
+            anim.lastNow = performance.now();
+
+            const loop = (now) => {
+                const dt = Math.min((now - anim.lastNow) / 1000, 0.1);
+                anim.lastNow = now;
+                anim.elapsed += dt;
+                tickAnim(dt);
+                renderAll();
+                anim.raf = requestAnimationFrame(loop);
+            };
+            anim._loop = loop;
+            anim.raf = requestAnimationFrame(loop);
+        }
+
+        function tickAnim(dt) {
+            const cols = parseInt(el.inputCols.value);
+            const N = state.totalFrames;
+            const rangeDur = Math.max(0.1, state.range.out - state.range.in);
+            const rate = N / rangeDur;
+            const t = anim.elapsed;
+
+            switch (anim.mode) {
+                case 'linear-lr': {
+                    const phase = (t * rate) % N;
+                    state.tiles.forEach((tile, i) => {
+                        if (tile.isPinned) return;
+                        const col = i % cols;
+                        tile.frameIndex = Math.round((phase + (col / Math.max(1, cols - 1)) * N * 0.6) % N);
+                    });
+                    break;
+                }
+                case 'linear-rl': {
+                    const phase = (t * rate) % N;
+                    state.tiles.forEach((tile, i) => {
+                        if (tile.isPinned) return;
+                        const col = i % cols;
+                        tile.frameIndex = Math.round((phase + ((cols - 1 - col) / Math.max(1, cols - 1)) * N * 0.6) % N);
+                    });
+                    break;
+                }
+                case 'temporal-shuffle': {
+                    const phase = (t * rate) % N;
+                    state.tiles.forEach((tile, i) => {
+                        if (tile.isPinned) return;
+                        tile.frameIndex = Math.round((phase + anim.tileOffsets[i] * N) % N);
+                    });
+                    break;
+                }
+                case 'drunk': {
+                    state.tiles.forEach((tile, i) => {
+                        if (tile.isPinned) return;
+                        const col = i % cols;
+                        const row = Math.floor(i / cols);
+                        const v = valueNoise3(
+                            col * 0.7 + anim.tileOffsets[i] * 5.1,
+                            row * 0.7 + anim.tileOffsets[i] * 3.7,
+                            t * 0.6
+                        );
+                        tile.frameIndex = Math.round(v * (N - 1));
+                    });
+                    break;
+                }
+                case 'perlin-flow': {
+                    state.tiles.forEach((tile, i) => {
+                        if (tile.isPinned) return;
+                        const col = i % cols;
+                        const row = Math.floor(i / cols);
+                        const v = valueNoise3(col * 0.35, row * 0.35, t * 0.12) * 2 - 1;
+                        anim.tilePhases[i] = ((anim.tilePhases[i] + v * rate * dt) % N + N) % N;
+                        tile.frameIndex = Math.round(anim.tilePhases[i]);
+                    });
+                    break;
+                }
+            }
+        }
+
+        function applySpatialShuffle(amount) {
+            const n = state.tiles.length;
+            const perm = Array.from({length: n}, (_, i) => i);
+            const swaps = Math.round((amount / 10) * n);
+            const rng = _seededRng(12345);
+            for (let i = 0; i < swaps; i++) {
+                const j = i + Math.floor(rng() * (n - i));
+                [perm[i], perm[j]] = [perm[j], perm[i]];
+            }
             state.tiles.forEach((t, i) => {
-                if (t.isPinned) return;
-                const step = (state.totalFrames - 1) / Math.max(1, count - 1);
-                // Use spatial order (i) for visual continuity
-                const rank = reverse ? (n - 1 - i) : i;
-                t.frameIndex = Math.floor(Math.min(state.totalFrames - 1, rank * ((state.totalFrames - 1) / Math.max(1, n - 1))));
+                const src = state.tiles[perm[i]];
+                t.srcX = src.origSrcX;
+                t.srcY = src.origSrcY;
             });
             renderAll();
-            updateTimeline();
         }
 
-        function presetShuffle() {
-            state.tiles.forEach(t => {
-                if (!t.isPinned) t.frameIndex = Math.floor(Math.random() * state.totalFrames);
-            });
-            renderAll();
-            updateTimeline();
-        }
+        el.selectMode.addEventListener('change', () => setMode(el.selectMode.value));
 
-        function presetReset() {
-            state.tiles.forEach(t => {
-                if (!t.isPinned) t.frameIndex = 0;
-            });
-            renderAll();
-            updateTimeline();
-        }
-
-        el.btnLinearLR.onclick = () => presetLinear(false);
-        el.btnLinearRL.onclick = () => presetLinear(true);
-        el.btnShuffle.onclick = presetShuffle;
-        el.btnReset.onclick = presetReset;
+        el.inputShuffleAmt.addEventListener('input', () => {
+            el.shuffleAmtValue.innerText = el.inputShuffleAmt.value;
+            if (anim.mode === 'spatial') applySpatialShuffle(parseInt(el.inputShuffleAmt.value));
+        });
 
         /* ==========================================================
            EXPORT — PNG
@@ -1948,6 +2103,9 @@
             const exportDuration = parseFloat(el.inputDuration.value);
             const totalOutputFrames = Math.round(exportDuration * fps);
 
+            const animLoopSaved = anim._loop;
+            if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
+
             state.isExporting = true;
             updateStatus();
 
@@ -1979,6 +2137,10 @@
                 hideLoading();
                 renderAll();
                 updateStatus();
+                if (animLoopSaved && anim.mode !== 'static' && anim.mode !== 'spatial') {
+                    anim.lastNow = performance.now();
+                    anim.raf = requestAnimationFrame(animLoopSaved);
+                }
             }
         }
 
@@ -2266,9 +2428,8 @@
         function enableControls() {
             const ctrls = [
                 el.inputCols, el.inputRows, el.checkSquare, el.checkGrid, el.checkLoop,
-                el.selectRes, el.selectFps, el.inputDuration,
-                el.btnGenerate, el.btnExportPng, el.btnExportVideo,
-                el.btnLinearLR, el.btnLinearRL, el.btnShuffle, el.btnReset
+                el.selectRes, el.selectFps, el.inputDuration, el.selectMode,
+                el.btnGenerate, el.btnExportPng, el.btnExportVideo
             ];
             ctrls.forEach(c => c.disabled = false);
             if (el.checkSquare.checked) el.inputRows.disabled = true;
@@ -2375,10 +2536,6 @@
             if (!state.ready) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
             switch (e.key.toLowerCase()) {
-                case 'l': presetLinear(false); break;
-                case 'k': presetLinear(true); break;
-                case 's': presetShuffle(); break;
-                case 'r': presetReset(); break;
                 case 'g': el.checkGrid.checked = !el.checkGrid.checked; renderAll(); break;
             }
         });
