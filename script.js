@@ -85,9 +85,8 @@ const el = {
     btnExportPng: $('btnExportPng'),
     btnExportVideo: $('btnExportVideo'),
     selectMode: $('selectMode'),
-    shuffleAmtRow: $('shuffleAmtRow'),
-    inputShuffleAmt: $('inputShuffleAmt'),
-    shuffleAmtValue: $('shuffleAmtValue'),
+    inputSpatialAmt: $('inputSpatialAmt'),
+    spatialAmtValue: $('spatialAmtValue'),
     selectPattern: $('selectPattern'),
     patternAmtRow: $('patternAmtRow'),
     inputPatternAmt: $('inputPatternAmt'),
@@ -573,6 +572,7 @@ function initProject() {
         }
     }
     setMode(anim.mode);
+    applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
     updateStatus();
 }
 
@@ -847,12 +847,7 @@ function valueNoise3(x, y, z) {
 function setMode(mode) {
     if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
 
-    if (anim.mode === 'spatial' && mode !== 'spatial') {
-        state.tiles.forEach(t => { t.srcX = t.origSrcX; t.srcY = t.origSrcY; });
-    }
-
     anim.mode = mode;
-    if (el.shuffleAmtRow) el.shuffleAmtRow.style.display = mode === 'spatial' ? '' : 'none';
 
     if (mode === 'static') {
         canvas.style.cursor = 'ew-resize';
@@ -861,13 +856,6 @@ function setMode(mode) {
     }
 
     canvas.style.cursor = 'default';
-
-    if (mode === 'spatial') {
-        el.inputShuffleAmt.disabled = false;
-        if (state.ready) applySpatialShuffle(parseInt(el.inputShuffleAmt.value));
-        return;
-    }
-    el.inputShuffleAmt.disabled = true;
 
     if (!state.ready) return;
 
@@ -972,9 +960,9 @@ function applySpatialShuffle(amount) {
 
 el.selectMode.addEventListener('change', () => setMode(el.selectMode.value));
 
-el.inputShuffleAmt.addEventListener('input', () => {
-    el.shuffleAmtValue.innerText = el.inputShuffleAmt.value;
-    if (anim.mode === 'spatial') applySpatialShuffle(parseInt(el.inputShuffleAmt.value));
+el.inputSpatialAmt.addEventListener('input', () => {
+    el.spatialAmtValue.innerText = el.inputSpatialAmt.value;
+    applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
 });
 
 /* ==========================================================
@@ -1088,7 +1076,7 @@ async function exportVideo() {
         hideLoading();
         renderAll();
         updateStatus();
-        if (animLoopSaved && anim.mode !== 'static' && anim.mode !== 'spatial') {
+        if (animLoopSaved && anim.mode !== 'static') {
             anim.lastNow = performance.now();
             anim.raf = requestAnimationFrame(animLoopSaved);
         }
@@ -1381,7 +1369,7 @@ function enableControls() {
         el.inputCols, el.inputRows, el.checkSquare, el.checkGrid, el.checkLoop,
         el.selectRes, el.selectFps, el.inputDuration, el.selectMode,
         el.btnGenerate, el.btnExportPng, el.btnExportVideo,
-        el.selectPattern, el.btnPatternClear
+        el.inputSpatialAmt, el.selectPattern, el.btnPatternClear
     ];
     ctrls.forEach(c => c.disabled = false);
     if (el.checkSquare.checked) el.inputRows.disabled = true;

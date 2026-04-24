@@ -92,15 +92,19 @@
                     <option value="temporal-shuffle">Shuffle (temporal)</option>
                     <option value="drunk">Drunk walk</option>
                     <option value="perlin-flow">Perlin flow</option>
-                    <option value="spatial">Spatial shuffle</option>
                 </select>
             </div>
-            <div class="slider-row" id="shuffleAmtRow" style="display: none;">
+        </div>
+
+        <!-- SPATIAL SHUFFLE -->
+        <div class="section">
+            <div class="section-title">SPATIAL SHUFFLE</div>
+            <div class="slider-row">
                 <div class="slider-head">
-                    <span class="field-label">Shuffle amount</span>
-                    <span class="slider-value" id="shuffleAmtValue">5</span>
+                    <span class="field-label">Amount</span>
+                    <span class="slider-value" id="spatialAmtValue">0</span>
                 </div>
-                <input type="range" class="slider" id="inputShuffleAmt" min="0" max="10" step="1" value="5" disabled>
+                <input type="range" class="slider" id="inputSpatialAmt" min="0" max="10" step="1" value="0" disabled>
             </div>
         </div>
 
