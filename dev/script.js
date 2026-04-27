@@ -1755,10 +1755,103 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ==========================================================
+   TUTORIAL MODAL
+   ========================================================== */
+
+let tutorialStep = 0;
+const TUTORIAL_STEPS = 4;
+
+function openTutorial() {
+    const overlay = $('tutorialOverlay');
+    if (!overlay) return;
+    tutorialStep = 0;
+    showTutorialStep(0);
+    overlay.classList.add('visible');
+}
+
+function closeTutorial() {
+    const overlay = $('tutorialOverlay');
+    if (!overlay) return;
+    overlay.classList.remove('visible');
+}
+
+function showTutorialStep(index) {
+    tutorialStep = Math.max(0, Math.min(TUTORIAL_STEPS - 1, index));
+
+    // Update steps visibility
+    document.querySelectorAll('.tutorial-step').forEach(el => {
+        el.classList.toggle('active', parseInt(el.dataset.step) === tutorialStep);
+    });
+
+    // Update dots
+    document.querySelectorAll('.tutorial-dot').forEach(dot => {
+        dot.classList.toggle('active', parseInt(dot.dataset.index) === tutorialStep);
+    });
+
+    // Update nav buttons
+    const prevBtn = $('tutorialPrev');
+    const nextBtn = $('tutorialNext');
+    if (prevBtn) prevBtn.style.visibility = tutorialStep === 0 ? 'hidden' : 'visible';
+    if (nextBtn) {
+        if (tutorialStep === TUTORIAL_STEPS - 1) {
+            nextBtn.textContent = 'Got it!';
+        } else {
+            nextBtn.textContent = 'Next →';
+        }
+    }
+}
+
+function goToPrevStep() {
+    showTutorialStep(tutorialStep - 1);
+}
+
+function goToNextStep() {
+    if (tutorialStep === TUTORIAL_STEPS - 1) {
+        closeTutorial();
+    } else {
+        showTutorialStep(tutorialStep + 1);
+    }
+}
+
+/* ==========================================================
    INIT
    ========================================================== */
 
 // Initial state
 updatePlayPauseUI();
 updateRamEstimate();
+
+// Tutorial: auto-show on first visit
+if (!localStorage.getItem('panotile_tutorial_seen')) {
+    localStorage.setItem('panotile_tutorial_seen', '1');
+    // Small delay to let DOM settle
+    setTimeout(openTutorial, 300);
+}
+
+// Tutorial event bindings
+const btnHelp = $('btnHelp');
+if (btnHelp) btnHelp.addEventListener('click', openTutorial);
+
+const tutorialOverlay = $('tutorialOverlay');
+if (tutorialOverlay) {
+    tutorialOverlay.addEventListener('click', (e) => {
+        if (e.target === tutorialOverlay) closeTutorial();
+    });
+}
+
+const tutorialClose = $('tutorialClose');
+if (tutorialClose) tutorialClose.addEventListener('click', closeTutorial);
+
+const tutorialPrev = $('tutorialPrev');
+if (tutorialPrev) tutorialPrev.addEventListener('click', goToPrevStep);
+
+const tutorialNext = $('tutorialNext');
+if (tutorialNext) tutorialNext.addEventListener('click', goToNextStep);
+
+// Dot navigation
+document.querySelectorAll('.tutorial-dot').forEach(dot => {
+    dot.addEventListener('click', () => {
+        showTutorialStep(parseInt(dot.dataset.index));
+    });
+});
 
