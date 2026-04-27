@@ -108,7 +108,7 @@ const el = {
     btnBrowse: $('btnBrowse'),
     emptyState: $('emptyState'),
     loadingOverlay: $('loadingOverlay'),
-    loadingText: $('loadingText').parentElement ? $('loadingText') : null,
+    loadingText: (() => { const el = $('loadingText'); return el && el.parentElement ? el : null; })(),
     progressFill: $('progressFill'),
     timeline: $('timeline'),
     tlTile: $('tlTile'),
@@ -610,33 +610,35 @@ function computeFrameIndex(tile, outputFrame, cols, N, rate, elapsed, tileOffset
     if (tile.isPinned) return tile.frameIndex;
 
     // Step 2: Stutter — quantize outputFrame to blocks
+    // At 1x: advances normally. At 3x: every 3 output frames, jumps 3 source frames.
+    // This creates a dreamy, staccato "step-printing" effect (Wong Kar-wai style).
     const stutterFactor = anim.stutter;
     const stutterFrame = Math.floor(outputFrame / stutterFactor) * stutterFactor;
 
-    // Step 3: Mode — determine base index
+    // Step 3: Mode — determine base index using the stutter-quantized frame
     let baseIndex;
     const t = elapsed;
 
     switch (anim.mode) {
         case 'standard': {
-            const rawPhase = t * rate;
+            const rawPhase = stutterFrame;
             baseIndex = Math.floor(rawPhase);
             break;
         }
         case 'linear-lr': {
-            const phase = (t * rate);
+            const phase = stutterFrame;
             const col = i % cols;
             baseIndex = Math.round((phase + (col / Math.max(1, cols - 1)) * N * 0.6));
             break;
         }
         case 'linear-rl': {
-            const phase = (t * rate);
+            const phase = stutterFrame;
             const col = i % cols;
             baseIndex = Math.round((phase + ((cols - 1 - col) / Math.max(1, cols - 1)) * N * 0.6));
             break;
         }
         case 'temporal-shuffle': {
-            const phase = (t * rate);
+            const phase = stutterFrame;
             baseIndex = Math.round(phase + tileOffsets[i] * N);
             break;
         }
@@ -1384,7 +1386,6 @@ function renderExportFrame(expCtx, expCanvas, outputFrame, totalFrames, fps) {
     expCtx.clearRect(0, 0, expCanvas.width, expCanvas.height);
 
     const cols = parseInt(el.inputCols.value);
-    const rows = parseInt(el.inputRows.value);
     const N = state.totalFrames;
     const rangeDur = Math.max(0.1, state.range.out - state.range.in);
     const rate = N / rangeDur;
@@ -1393,10 +1394,6 @@ function renderExportFrame(expCtx, expCanvas, outputFrame, totalFrames, fps) {
     // Scale tile positions from preview canvas to export canvas
     const scaleX = expCanvas.width / canvas.width;
     const scaleY = expCanvas.height / canvas.height;
-
-    // Source-to-export scaling (source frames are at original video resolution)
-    const srcScaleX = expCanvas.width / state.video.width;
-    const srcScaleY = expCanvas.height / state.video.height;
 
     for (let i = 0; i < state.tiles.length; i++) {
         const tile = state.tiles[i];
@@ -1450,7 +1447,6 @@ async function exportVideoMediaRecorder() {
 
     // Setup MediaRecorder
     const stream = expCanvas.captureStream(0);
-    const videoTrack = stream.getVideoTracks()[0];
 
     // Prefer VP9, fallback to VP8
     let mimeType = 'video/webm;codecs=vp9';
@@ -1471,13 +1467,13 @@ async function exportVideoMediaRecorder() {
     recorder.start(100); // timeslice 100ms
 
     // Render frames with requestAnimationFrame sync
+    // captureStream(0) captures the canvas at compositor refresh rate.
+    // We render each frame then wait for the next rAF to ensure the
+    // compositor has picked up the new canvas content.
     for (let i = 0; i < totalFrames; i++) {
         renderExportFrame(expCtx, expCanvas, i, totalFrames, fps);
 
-        // Use requestFrame for sync
-        videoTrack.requestFrame();
-
-        // Wait for next frame using requestAnimationFrame
+        // Wait for next frame using requestAnimationFrame to sync with compositor
         await waitFrames(1);
 
         el.progressFill.style.width = `${((i + 1) / totalFrames) * 100}%`;
@@ -1485,10 +1481,11 @@ async function exportVideoMediaRecorder() {
 
     // Flush: wait 300ms before stopping
     await new Promise(r => setTimeout(r, 300));
-    recorder.stop();
 
-    // Wait for final data
-    await new Promise(r => { recorder.onstop = r; });
+    // Set onstop BEFORE calling stop() to avoid race condition
+    const stopPromise = new Promise(r => { recorder.onstop = r; });
+    recorder.stop();
+    await stopPromise;
 
     const blob = new Blob(chunks, { type: mimeType });
 
