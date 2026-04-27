@@ -33,6 +33,7 @@ const state = {
     dragStartX: 0,
     dragStartFrame: 0,
     isExporting: false,
+    scrubbingTile: null,
     ready: false
 };
 
@@ -825,12 +826,14 @@ canvas.style.touchAction = 'none';
 canvas.addEventListener('pointerdown', (e) => {
     // Left mouse button, primary touch, or pen — ignore middle/right
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (anim.mode !== 'standard' || anim.playing) return;
+    // Allow scrub in Standard mode even while playing (live time-scrubbing)
+    if (anim.mode !== 'standard') return;
     const t = tileAtEvent(e);
     if (t && !t.isPinned) {
         state.activeTile = t;
         state.hoverTile = t;
         state.isDragging = true;
+        state.scrubbingTile = t;
         state.dragStartX = e.clientX;
         state.dragStartFrame = t.frameIndex;
         document.body.style.cursor = 'ew-resize';
@@ -1055,6 +1058,9 @@ function tickAnim(dt) {
     const outputFrame = t * rate;
 
     state.tiles.forEach((tile, i) => {
+        // Skip the tile currently being scrubbed by the user
+        if (tile === state.scrubbingTile) return;
+
         // Use the pipeline: Pin → Stutter → Mode → Loop
         tile.frameIndex = computeFrameIndex(
             tile, outputFrame, cols, N, rate, t,
@@ -1074,12 +1080,35 @@ function tickAnim(dt) {
    ========================================================== */
 
 function applySpatialShuffle(amount) {
-    state.tiles.forEach(t => {
-        const dx = (Math.random() - 0.5) * amount * 10;
-        const dy = (Math.random() - 0.5) * amount * 10;
-        t.srcX = t.origSrcX + dx;
-        t.srcY = t.origSrcY + dy;
+    // Spatial Shuffle: swap frameIndex values between tiles.
+    // amount (0-10): 0 = no shuffle, 10 = full shuffle.
+    // The shuffle intensity determines how many swaps to perform.
+    const n = state.tiles.length;
+    if (n < 2) return;
+
+    // Collect current frame indices
+    const indices = state.tiles.map(t => t.frameIndex);
+
+    // Fisher-Yates shuffle with intensity control
+    // amount=10 → full shuffle (n swaps), amount=5 → 50% swaps
+    const swapCount = Math.round((amount / 10) * n);
+
+    for (let s = 0; s < swapCount; s++) {
+        const a = Math.floor(Math.random() * n);
+        const b = Math.floor(Math.random() * n);
+        if (a !== b) {
+            // Swap frame indices
+            const tmp = indices[a];
+            indices[a] = indices[b];
+            indices[b] = tmp;
+        }
+    }
+
+    // Apply shuffled indices back to tiles
+    state.tiles.forEach((t, i) => {
+        t.frameIndex = indices[i];
     });
+
     if (!anim.playing) renderAll();
 }
 
@@ -1341,6 +1370,11 @@ async function exportVideoWebCodecs() {
             await new Promise(r => setTimeout(r, 10));
         }
 
+        // Safety: if encoder was closed (e.g. by an error), abort
+        if (encoder.state === 'closed') {
+            throw new Error('VideoEncoder closed unexpectedly during export');
+        }
+
         // Render the frame at output frame i
         renderExportFrame(expCtx, expCanvas, i, totalFrames, fps);
 
@@ -1357,6 +1391,12 @@ async function exportVideoWebCodecs() {
 
         // Update progress
         el.progressFill.style.width = `${((i + 1) / totalFrames) * 100}%`;
+    }
+
+    // Wait for all pending encodes to complete before flushing
+    // This prevents "Cannot call 'encode' on a closed codec" errors
+    while (encoder.encodeQueueSize > 0) {
+        await new Promise(r => setTimeout(r, 10));
     }
 
     // Finalize
