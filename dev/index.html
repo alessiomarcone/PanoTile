@@ -86,28 +86,36 @@
             <div class="field">
                 <div class="field-label">Mode</div>
                 <select class="field-select" id="selectMode" disabled>
-                    <option value="static">Static</option>
+                    <option value="standard">Standard</option>
                     <option value="linear-lr">Linear →</option>
                     <option value="linear-rl">Linear ←</option>
                     <option value="temporal-shuffle">Shuffle (temporal)</option>
                     <option value="drunk">Drunk walk</option>
                     <option value="perlin-flow">Perlin flow</option>
-                    <option value="spatial-shuffle">Spatial shuffle</option>
                 </select>
-            </div>
-
-            <div class="slider-row" id="spatialAmtRow" style="display: none;">
-                <div class="slider-head">
-                    <span class="field-label">Shuffle amount</span>
-                    <span class="slider-value" id="spatialAmtValue">5</span>
-                </div>
-                <input type="range" class="slider" id="inputSpatialAmt" min="0" max="10" step="1" value="5" disabled>
             </div>
 
             <button class="btn btn-playpause" id="btnPlayPause" disabled aria-label="Play">
                 <span class="playpause-icon" id="playpauseIcon">▶</span>
                 <span class="playpause-label" id="playpauseLabel">Play</span>
             </button>
+        </div>
+
+        <!-- SPATIAL SHUFFLE -->
+        <div class="section">
+            <div class="section-title">SPATIAL SHUFFLE</div>
+            <label class="toggle">
+                <span>Enable</span>
+                <input type="checkbox" id="checkSpatialShuffle" disabled>
+                <span class="toggle-track"></span>
+            </label>
+            <div class="slider-row" id="spatialAmtRow">
+                <div class="slider-head">
+                    <span class="field-label">Shuffle amount</span>
+                    <span class="slider-value" id="spatialAmtValue">5</span>
+                </div>
+                <input type="range" class="slider" id="inputSpatialAmt" min="0" max="10" step="1" value="5" disabled>
+            </div>
         </div>
 
         <!-- BLOCK PATTERN -->

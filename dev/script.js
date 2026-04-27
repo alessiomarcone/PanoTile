@@ -37,7 +37,7 @@ const state = {
 };
 
 const anim = {
-    mode: 'static',
+    mode: 'standard',
     raf: null,
     lastNow: 0,
     elapsed: 0,
@@ -92,6 +92,7 @@ const el = {
     btnPlayPause: $('btnPlayPause'),
     playpauseIcon: $('playpauseIcon'),
     playpauseLabel: $('playpauseLabel'),
+    checkSpatialShuffle: $('checkSpatialShuffle'),
     selectPattern: $('selectPattern'),
     patternAmtRow: $('patternAmtRow'),
     inputPatternAmt: $('inputPatternAmt'),
@@ -577,6 +578,9 @@ function initProject() {
         }
     }
     setMode(anim.mode);
+    if (el.checkSpatialShuffle.checked && state.ready) {
+        applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
+    }
     updateStatus();
 }
 
@@ -705,7 +709,7 @@ canvas.style.touchAction = 'none';
 canvas.addEventListener('pointerdown', (e) => {
     // Left mouse button, primary touch, or pen — ignore middle/right
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (anim.mode !== 'static') return;
+    if (anim.mode !== 'standard' || anim.playing) return;
     const t = tileAtEvent(e);
     if (t && !t.isPinned) {
         state.activeTile = t;
@@ -853,21 +857,10 @@ function setMode(mode) {
     anim.playing = false;
     anim.mode = mode;
 
-    el.spatialAmtRow.style.display = (mode === 'spatial-shuffle') ? '' : 'none';
-
-    if (mode === 'spatial-shuffle') {
-        canvas.style.cursor = 'default';
-        if (state.ready) applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
-        updatePlayPauseUI();
-        return;
-    }
-
-    // Any non-spatial mode: ensure source coords are back to original
-    resetSpatialShuffle();
-
-    if (mode === 'static') {
+    if (mode === 'standard') {
         canvas.style.cursor = 'ew-resize';
-        renderAll();
+        anim.elapsed = 0;
+        if (state.ready) renderAll();
         updatePlayPauseUI();
         return;
     }
@@ -887,7 +880,6 @@ function setMode(mode) {
 }
 
 function play() {
-    if (anim.mode === 'static' || anim.mode === 'spatial-shuffle') return;
     if (!state.ready) return;
     if (anim.raf) return;
     anim.lastNow = performance.now();
@@ -917,8 +909,7 @@ function togglePlayPause() {
 }
 
 function updatePlayPauseUI() {
-    const animatable = anim.mode !== 'static' && anim.mode !== 'spatial-shuffle';
-    el.btnPlayPause.disabled = !animatable || !state.ready;
+    el.btnPlayPause.disabled = !state.ready;
     if (anim.playing) {
         el.playpauseIcon.innerText = '⏸';
         el.playpauseLabel.innerText = 'Pause';
@@ -945,6 +936,18 @@ function tickAnim(dt) {
     const t = anim.elapsed;
 
     switch (anim.mode) {
+        case 'standard': {
+            const rawPhase = t * rate;
+            const loop = el.checkLoop.checked;
+            const phase = loop ? rawPhase % N : Math.min(rawPhase, N - 1);
+            const fi = Math.min(Math.floor(phase), N - 1);
+            state.tiles.forEach(tile => {
+                if (tile.isPinned) return;
+                tile.frameIndex = fi;
+            });
+            if (!loop && rawPhase >= N) pause();
+            break;
+        }
         case 'linear-lr': {
             const phase = (t * rate) % N;
             state.tiles.forEach((tile, i) => {
@@ -1020,8 +1023,17 @@ el.selectMode.addEventListener('change', () => setMode(el.selectMode.value));
 
 el.inputSpatialAmt.addEventListener('input', () => {
     el.spatialAmtValue.innerText = el.inputSpatialAmt.value;
-    if (anim.mode === 'spatial-shuffle' && state.ready) {
+    if (el.checkSpatialShuffle.checked && state.ready) {
         applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
+    }
+});
+
+el.checkSpatialShuffle.addEventListener('change', () => {
+    if (el.checkSpatialShuffle.checked && state.ready) {
+        applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
+    } else {
+        resetSpatialShuffle();
+        if (state.ready) renderAll();
     }
 });
 
@@ -1430,7 +1442,7 @@ function enableControls() {
         el.inputCols, el.inputRows, el.checkSquare, el.checkGrid, el.checkLoop,
         el.selectRes, el.selectFps, el.inputDuration, el.selectMode,
         el.btnGenerate, el.btnExportPng, el.btnExportVideo,
-        el.inputSpatialAmt, el.selectPattern, el.btnPatternClear
+        el.inputSpatialAmt, el.checkSpatialShuffle, el.selectPattern, el.btnPatternClear
     ];
     ctrls.forEach(c => c.disabled = false);
     if (el.checkSquare.checked) el.inputRows.disabled = true;
