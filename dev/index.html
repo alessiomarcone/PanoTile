@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/png" href="img/favicon/favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="img/favicon/favicon.svg" />
+    <link rel="shortcut icon" href="img/favicon/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="img/favicon/apple-touch-icon.png" />
+    <link rel="manifest" href="img/favicon/site.webmanifest" />
+    <title>PanoTile — Time-displacement video editor</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- mp4-muxer: produces MP4 H.264 files from WebCodecs-encoded frames. -->
+    <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2"></script>
+</head>
+
+<body>
+
+    <aside class="sidebar">
+        <div class="logo">
+            <div class="logo-mark">▣</div>
+            <div class="logo-name">PanoTile</div>
+            <div class="logo-version">dev</div>
+        </div>
+
+        <!-- SOURCE -->
+        <div class="section">
+            <div class="section-title">SOURCE</div>
+            <div class="source-card empty" id="sourceCard">
+                <div class="source-meta" style="text-align: center;">
+                    <div class="source-name" style="color: var(--text-mute);">Drop video or click</div>
+                    <div class="source-specs">MP4 · WebM · MOV · ≤200 MB</div>
+                </div>
+            </div>
+            <input type="file" id="videoUpload" accept="video/mp4,video/webm,video/quicktime" style="display: none;">
+        </div>
+
+        <!-- RANGE (hidden until video loaded) -->
+        <div class="section" id="sectionRange" style="display: none;">
+            <div class="section-title">RANGE</div>
+            <div class="range-selector" id="rangeSelector">
+                <div class="range-thumbstrip" id="rangeStrip"></div>
+                <div class="range-mask" id="rangeMaskL" style="left: 0; width: 0%;"></div>
+                <div class="range-mask" id="rangeMaskR" style="right: 0; width: 0%;"></div>
+                <div class="range-active" id="rangeActive" style="left: 0%; right: 0%;"></div>
+                <div class="range-handle left" id="rangeHandleL" style="left: 0%;"></div>
+                <div class="range-handle right" id="rangeHandleR" style="left: 100%;"></div>
+            </div>
+            <div class="range-readout">
+                <span id="rangeIn">00:00.00</span>
+                <span id="rangeDur" style="color: var(--accent);">—</span>
+                <span id="rangeOut">00:00.00</span>
+            </div>
+        </div>
+
+        <!-- GRID -->
+        <div class="section">
+            <div class="section-title">GRID</div>
+            <div class="field-row">
+                <div class="field">
+                    <div class="field-label">Cols</div>
+                    <input type="number" class="field-input" id="inputCols" value="4" min="1" max="30" disabled>
+                </div>
+                <div class="field">
+                    <div class="field-label">Rows</div>
+                    <input type="number" class="field-input" id="inputRows" value="4" min="1" max="30" disabled>
+                </div>
+            </div>
+            <label class="toggle">
+                <span>Square tiles</span>
+                <input type="checkbox" id="checkSquare" disabled>
+                <span class="toggle-track"></span>
+            </label>
+            <label class="toggle">
+                <span>Show grid</span>
+                <input type="checkbox" id="checkGrid" checked disabled>
+                <span class="toggle-track"></span>
+            </label>
+            <button class="btn" id="btnGenerate" disabled>Regenerate grid</button>
+        </div>
+
+        <!-- TIME ENGINE -->
+        <div class="section">
+            <div class="section-title">TIME ENGINE</div>
+            <div class="field">
+                <div class="field-label">Mode</div>
+                <select class="field-select" id="selectMode" disabled>
+                    <option value="static">Static</option>
+                    <option value="linear-lr">Linear →</option>
+                    <option value="linear-rl">Linear ←</option>
+                    <option value="temporal-shuffle">Shuffle (temporal)</option>
+                    <option value="drunk">Drunk walk</option>
+                    <option value="perlin-flow">Perlin flow</option>
+                    <option value="spatial-shuffle">Spatial shuffle</option>
+                </select>
+            </div>
+
+            <div class="slider-row" id="spatialAmtRow" style="display: none;">
+                <div class="slider-head">
+                    <span class="field-label">Shuffle amount</span>
+                    <span class="slider-value" id="spatialAmtValue">5</span>
+                </div>
+                <input type="range" class="slider" id="inputSpatialAmt" min="0" max="10" step="1" value="5" disabled>
+            </div>
+
+            <button class="btn btn-playpause" id="btnPlayPause" disabled aria-label="Play">
+                <span class="playpause-icon" id="playpauseIcon">▶</span>
+                <span class="playpause-label" id="playpauseLabel">Play</span>
+            </button>
+        </div>
+
+        <!-- BLOCK PATTERN -->
+        <div class="section">
+            <div class="section-title">BLOCK PATTERN</div>
+            <div class="field">
+                <div class="field-label">Pattern</div>
+                <select class="field-select" id="selectPattern" disabled>
+                    <option value="none">None</option>
+                    <option value="checkerboard">Checkerboard</option>
+                    <option value="random">Random %</option>
+                    <option value="borders">Borders</option>
+                    <option value="center">Center</option>
+                </select>
+            </div>
+
+            <div class="slider-row" id="patternAmtRow" style="display: none;">
+                <div class="slider-head">
+                    <span class="field-label">Amount</span>
+                    <span class="slider-value"><span id="patternAmtValue">50</span>%</span>
+                </div>
+                <input type="range" class="slider" id="inputPatternAmt" min="0" max="100" step="1" value="50" disabled>
+            </div>
+
+            <div class="btn-grid-2">
+                <button class="btn" id="btnPatternApply" disabled>Apply</button>
+                <button class="btn" id="btnPatternClear" disabled>Clear all</button>
+            </div>
+        </div>
+
+        <!-- EXPORT -->
+        <div class="section spacer">
+            <div class="section-title">EXPORT</div>
+
+            <div class="slider-row">
+                <div class="slider-head">
+                    <span class="field-label">Duration</span>
+                    <span class="slider-value"><span id="durationValue">5.0</span>s</span>
+                </div>
+                <input type="range" class="slider" id="inputDuration" min="1" max="60" step="0.5" value="5" disabled>
+            </div>
+
+            <div class="field-row">
+                <div class="field">
+                    <div class="field-label">Res</div>
+                    <select class="field-select" id="selectRes" disabled>
+                        <option value="preview">Preview</option>
+                        <option value="720">720p</option>
+                        <option value="1080" selected>1080p</option>
+                        <option value="4k">4K UHD</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <div class="field-label">FPS</div>
+                    <select class="field-select" id="selectFps" disabled>
+                        <option value="24">24</option>
+                        <option value="30" selected>30</option>
+                        <option value="60">60</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="ram-estimate" id="ramEstimate">
+                <span id="ramLabel">—</span>
+                <div class="ram-bar"><div class="ram-bar-fill" id="ramFill"></div></div>
+                <span id="ramValue">0 MB</span>
+            </div>
+
+            <label class="toggle">
+                <span>Loop playback</span>
+                <input type="checkbox" id="checkLoop" checked disabled>
+                <span class="toggle-track"></span>
+            </label>
+            <button class="btn" id="btnExportPng" disabled>Export PNG</button>
+            <button class="btn btn-primary" id="btnExportVideo" disabled>Export video</button>
+        </div>
+    </aside>
+
+    <!-- WORKSPACE -->
+    <main class="workspace">
+        <div class="status-bar" id="statusBar">
+            <span id="statusCanvas">—</span>
+            <span class="status-dot"></span>
+            <span id="statusTiles">—</span>
+            <span class="status-dot"></span>
+            <span id="statusPinned" class="status-pinned" style="display: none;">0 PINNED</span>
+            <span id="statusState" class="status-ready" style="display: none;">READY</span>
+        </div>
+
+        <div class="canvas-wrap" id="canvasWrap">
+            <div class="empty-state" id="emptyState">
+                <div class="empty-state-icon">▣</div>
+                <h2>PanoTile Studio</h2>
+                <p>Drag a video file here, or click to browse.<br>Your file stays in your browser — no upload.</p>
+                <button class="btn" id="btnBrowse">Browse files</button>
+            </div>
+
+            <canvas id="mosaicCanvas"></canvas>
+
+            <div id="loadingOverlay">
+                <div id="loadingText">PROCESSING</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="timeline" id="timeline">
+            <div class="timeline-meta">
+                <span id="tlTile">—</span>
+                <span id="tlTime">00:00.00 / 00:00.00</span>
+            </div>
+            <div class="timeline-track">
+                <div class="timeline-fill" id="tlFill"></div>
+                <div class="timeline-playhead" id="tlHead"></div>
+            </div>
+            <div class="timeline-legend">
+                <span class="legend-item"><span class="legend-swatch active"></span>active</span>
+                <span class="legend-item"><span class="legend-swatch pinned"></span>pinned</span>
+                <span class="legend-hint">drag ↔ to scrub · right-click or long-press to pin</span>
+            </div>
+        </div>
+    </main>
+
+    <!-- TOAST -->
+    <div id="toast">
+        <span class="toast-dot"></span>
+        <span id="toastMsg">Error</span>
+    </div>
+
+    <!-- CONFIRM -->
+    <div id="confirmDialog">
+        <div class="confirm-box">
+            <div class="confirm-title" id="confirmTitle">Regenerate grid?</div>
+            <div class="confirm-msg" id="confirmMsg">This will reset all pinned tiles and time positions.</div>
+            <div class="confirm-actions">
+                <button class="btn" id="confirmCancel">Cancel</button>
+                <button class="btn btn-primary" id="confirmOk">Regenerate</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js" defer></script>
+</body>
+
+</html>
