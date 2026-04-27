@@ -95,6 +95,23 @@
                 </select>
             </div>
 
+            <div class="field">
+                <div class="field-label">Loop</div>
+                <select class="field-select" id="selectLoop" disabled>
+                    <option value="wrap">Wrap (Loop)</option>
+                    <option value="pingpong">Ping-pong</option>
+                    <option value="hold">Hold last frame</option>
+                </select>
+            </div>
+
+            <div class="slider-row">
+                <div class="slider-head">
+                    <span class="field-label">Stutter</span>
+                    <span class="slider-value"><span id="stutterValue">1</span>x</span>
+                </div>
+                <input type="range" class="slider" id="inputStutter" min="1" max="6" step="1" value="1" disabled>
+            </div>
+
             <button class="btn btn-playpause" id="btnPlayPause" disabled aria-label="Play">
                 <span class="playpause-icon" id="playpauseIcon">▶</span>
                 <span class="playpause-label" id="playpauseLabel">Play</span>
@@ -171,6 +188,7 @@
                 <div class="field">
                     <div class="field-label">FPS</div>
                     <select class="field-select" id="selectFps" disabled>
+                        <option value="12">12</option>
                         <option value="24">24</option>
                         <option value="30" selected>30</option>
                         <option value="60">60</option>
