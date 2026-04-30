@@ -24,7 +24,6 @@ const state = {
     video: { width: 0, height: 0, duration: 0, name: '', size: 0, blobUrl: null, probe: null },
     range: { in: 0, out: 0 },
     totalFrames: 0,
-    extractedWith: null,             // { rangeIn, rangeOut, frameCount } — to detect when regenerate is needed
     frames: [],
     tiles: [],
     hoverTile: null,
@@ -89,7 +88,6 @@ const el = {
     ramLabel: $('ramLabel'),
     ramFill: $('ramFill'),
     ramValue: $('ramValue'),
-    btnGenerate: $('btnGenerate'),
     btnExportPng: $('btnExportPng'),
     btnExportVideo: $('btnExportVideo'),
     selectMode: $('selectMode'),
@@ -374,16 +372,10 @@ async function extractFrames(probe) {
     el.emptyState.style.display = 'none';
     el.timeline.classList.add('visible');
     state.ready = true;
-    state.extractedWith = {
-        rangeIn: state.range.in,
-        rangeOut: state.range.out,
-        frameCount: state.totalFrames
-    };
     enableControls();
     initProject();
     updateStatus();
     updateRamEstimate();
-    markRegenerateStatus();
 }
 
 function seekAndCapture(probe, tCtx, temp, targetTime) {
@@ -512,7 +504,6 @@ window.addEventListener('pointermove', (e) => {
     }
     renderRangeUI();
     updateRamEstimate();
-    markRegenerateStatus();
 });
 
 window.addEventListener('pointerup', () => {
@@ -1195,7 +1186,6 @@ function enableControls() {
     el.inputRows.disabled = false;
     el.checkSquare.disabled = false;
     el.checkGrid.disabled = false;
-    el.btnGenerate.disabled = false;
     el.btnExportPng.disabled = false;
     el.btnExportVideo.disabled = false;
     el.selectMode.disabled = false;
@@ -1212,21 +1202,6 @@ function enableControls() {
     el.btnPlayPause.disabled = false;
     if (el.selectLoop) el.selectLoop.disabled = false;
     if (el.inputStutter) el.inputStutter.disabled = false;
-}
-
-function markRegenerateStatus() {
-    // Check if range or fps changed since last extraction
-    if (!state.extractedWith) return;
-    const current = {
-        rangeIn: state.range.in,
-        rangeOut: state.range.out,
-        frameCount: computeSourceFrameCount()
-    };
-    const prev = state.extractedWith;
-    const changed = current.rangeIn !== prev.rangeIn ||
-                    current.rangeOut !== prev.rangeOut ||
-                    current.frameCount !== prev.frameCount;
-    el.btnGenerate.classList.toggle('warn', changed);
 }
 
 /* ==========================================================
@@ -1360,14 +1335,16 @@ async function exportVideoWebCodecs() {
         fastStart: 'in-memory'
     });
 
-    // Codec level must match resolution — H.264 L3.0 only supports SD
-    const codecByRes = {
-        'preview': 'avc1.42001f', // Baseline L3.1 — up to 1280×720@30
-        '720':     'avc1.42001f', // Baseline L3.1
-        '1080':    'avc1.420028', // Baseline L4.0 — up to 1920×1080@30
-        '4k':      'avc1.420033', // Baseline L5.1 — up to 3840×2160@30
-    };
-    const codecString = codecByRes[res] || 'avc1.420028';
+    // Pick the minimum H.264 level that covers the actual pixel area.
+    // Using a level too low throws "coded area exceeds maximum" even after the
+    // aspect-ratio fix (e.g. 732×1280 = 937k px > L3.1 limit of 921k px).
+    const codecString = (() => {
+        const px = expW * expH;
+        if (px <= 921600)  return 'avc1.42001f'; // Baseline L3.1 ≤ 1280×720
+        if (px <= 2097152) return 'avc1.420028'; // Baseline L4.0 ≤ ~1920×1080
+        if (px <= 9437184) return 'avc1.420033'; // Baseline L5.1 ≤ 3840×2160
+        return 'avc1.420034';                     // Baseline L5.2 for anything larger
+    })();
 
     // Capture encoder errors via variable — throwing inside WebCodecs callbacks
     // does NOT propagate to the outer async try/catch; it only closes the encoder.
@@ -1694,20 +1671,6 @@ el.btnPatternApply.addEventListener('click', () => {
 el.btnPatternClear.addEventListener('click', clearAllPins);
 
 // Generate
-el.btnGenerate.addEventListener('click', async () => {
-    if (!state.ready) return;
-    const ok = await confirm(
-        'Regenerate grid?',
-        'This will reset all pinned tiles and time positions.',
-        'Regenerate'
-    );
-    if (ok) {
-        pause();
-        initProject();
-        renderAll();
-    }
-});
-
 // Export
 el.btnExportVideo.addEventListener('click', exportVideo);
 el.btnExportPng.addEventListener('click', exportPng);
