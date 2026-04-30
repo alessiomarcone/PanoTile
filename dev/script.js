@@ -582,6 +582,7 @@ function initProject() {
                 srcW: sW,
                 srcH: sH,
                 frameIndex: 0,
+                frameOffset: 0,
                 isPinned: false,
                 id: r * cols + c
             });
@@ -622,7 +623,7 @@ function computeFrameIndex(tile, outputFrame, cols, N, rate, elapsed, tileOffset
 
     switch (anim.mode) {
         case 'standard': {
-            const rawPhase = stutterFrame;
+            const rawPhase = stutterFrame + tile.frameOffset;
             baseIndex = Math.floor(rawPhase);
             break;
         }
@@ -835,7 +836,7 @@ canvas.addEventListener('pointerdown', (e) => {
         state.isDragging = true;
         state.scrubbingTile = t;
         state.dragStartX = e.clientX;
-        state.dragStartFrame = t.frameIndex;
+        state.dragStartFrame = t.frameOffset;
         document.body.style.cursor = 'ew-resize';
         // Capture so we keep receiving events if the pointer leaves the canvas
         try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* no-op */ }
@@ -850,12 +851,21 @@ canvas.addEventListener('pointermove', (e) => {
         const r = canvas.getBoundingClientRect();
         const px = e.clientX - state.dragStartX;
         const sensitivity = Math.max(4, r.width / state.totalFrames * 1.2);
-        let idx = state.dragStartFrame + Math.floor(px / sensitivity);
-        idx = Math.max(0, Math.min(state.totalFrames - 1, idx));
-        if (state.activeTile && state.activeTile.frameIndex !== idx) {
-            state.activeTile.frameIndex = idx;
-            renderAll();
-            updateTimeline();
+        const N = state.totalFrames;
+        let newOffset = state.dragStartFrame + Math.floor(px / sensitivity);
+        newOffset = Math.max(-(N - 1), Math.min(N - 1, newOffset));
+        if (state.activeTile) {
+            state.activeTile.frameOffset = newOffset;
+            const rangeDur = Math.max(0.1, state.range.out - state.range.in);
+            const rate = N / rangeDur;
+            const outputFrame = anim.elapsed * rate;
+            const stutterFrame = Math.floor(outputFrame / anim.stutter) * anim.stutter;
+            const idx = applyLoop(Math.floor(stutterFrame + newOffset), N);
+            if (state.activeTile.frameIndex !== idx) {
+                state.activeTile.frameIndex = idx;
+                renderAll();
+                updateTimeline();
+            }
         }
         return;
     }
@@ -873,6 +883,7 @@ const endDrag = () => {
     if (state.isDragging) {
         state.hoverTile = state.activeTile;
         state.isDragging = false;
+        state.scrubbingTile = null;
         state.activeTile = null;
         document.body.style.cursor = '';
         renderAll();
@@ -1283,6 +1294,7 @@ async function exportVideo() {
 
     state.isExporting = true;
     updateStatus();
+    showLoading('EXPORTING...');
 
     const path = getExportPath();
     console.log(`Export path: ${path} (${path === 'A' ? 'WebCodecs+mp4-muxer' : 'MediaRecorder fallback'})`);
@@ -1297,6 +1309,7 @@ async function exportVideo() {
         console.error('Export failed:', err);
         showToast(`Export failed: ${err.message || 'Unknown error'}`);
     } finally {
+        hideLoading();
         state.isExporting = false;
         updateStatus();
     }
@@ -1349,7 +1362,7 @@ async function exportVideoWebCodecs() {
     // Setup VideoEncoder
     let frameCount = 0;
     const encoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addChunk(chunk),
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
         error: (err) => { throw new Error(`VideoEncoder error: ${err.message}`); }
     });
 
@@ -1401,6 +1414,7 @@ async function exportVideoWebCodecs() {
 
     // Finalize
     await encoder.flush();
+    encoder.close();
     muxer.finalize();
 
     // Get the buffer
