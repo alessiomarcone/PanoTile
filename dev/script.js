@@ -1327,8 +1327,12 @@ async function exportVideoWebCodecs() {
         expW = canvas.width;
         expH = canvas.height;
     } else {
-        const dims = { '720': [1280, 720], '1080': [1920, 1080], '4k': [3840, 2160] };
-        [expW, expH] = dims[res] || [1920, 1080];
+        // Scale the canvas aspect ratio to fit the chosen resolution tier.
+        // Hardcoded 16:9 dims would stretch portrait or square content.
+        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
+        const aspect = canvas.width / canvas.height;
+        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
+        else             { expH = longSide; expW = Math.round(longSide * aspect); }
     }
     const even = ensureEvenDimensions(expW, expH);
     expW = even.width;
@@ -1495,8 +1499,12 @@ async function exportVideoMediaRecorder() {
         expW = canvas.width;
         expH = canvas.height;
     } else {
-        const dims = { '720': [1280, 720], '1080': [1920, 1080], '4k': [3840, 2160] };
-        [expW, expH] = dims[res] || [1920, 1080];
+        // Scale the canvas aspect ratio to fit the chosen resolution tier.
+        // Hardcoded 16:9 dims would stretch portrait or square content.
+        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
+        const aspect = canvas.width / canvas.height;
+        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
+        else             { expH = longSide; expW = Math.round(longSide * aspect); }
     }
     const even = ensureEvenDimensions(expW, expH);
     expW = even.width;
@@ -1606,8 +1614,12 @@ function exportPng() {
         expW = canvas.width;
         expH = canvas.height;
     } else {
-        const dims = { '720': [1280, 720], '1080': [1920, 1080], '4k': [3840, 2160] };
-        [expW, expH] = dims[res] || [1920, 1080];
+        // Scale the canvas aspect ratio to fit the chosen resolution tier.
+        // Hardcoded 16:9 dims would stretch portrait or square content.
+        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
+        const aspect = canvas.width / canvas.height;
+        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
+        else             { expH = longSide; expW = Math.round(longSide * aspect); }
     }
 
     const expCanvas = document.createElement('canvas');
