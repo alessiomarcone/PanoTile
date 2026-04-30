@@ -719,9 +719,9 @@ function renderAll() {
 function drawGrid() {
     // Magenta with subtle glow for high visibility against any content
     ctx.save();
-    ctx.shadowColor = 'rgba(255, 46, 136, 0.5)';
+    ctx.shadowColor = 'rgba(26, 31, 40, .51)';
     ctx.shadowBlur = 2;
-    ctx.strokeStyle = 'rgba(255, 46, 136, 0.95)';
+    ctx.strokeStyle = 'rgba(26, 31, 40, 1)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     const cols = parseInt(el.inputCols.value);
