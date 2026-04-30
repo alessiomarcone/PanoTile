@@ -1003,6 +1003,13 @@ function setMode(mode) {
 function play() {
     if (!state.ready) return;
     if (anim.raf) return;
+    // In hold mode, if we've already reached the end, restart from the beginning
+    // so that pressing Play again replays instead of freezing immediately.
+    if (anim.loopMode === 'hold') {
+        const N = state.totalFrames;
+        const rangeDur = Math.max(0.1, state.range.out - state.range.in);
+        if (anim.elapsed * (N / rangeDur) >= N - 1) anim.elapsed = 0;
+    }
     anim.lastNow = performance.now();
     const loop = (now) => {
         const dt = Math.min((now - anim.lastNow) / 1000, 0.1);
@@ -1069,12 +1076,7 @@ function tickAnim(dt) {
             anim.tileOffsets, anim.tilePhases, i
         );
     });
-
-    // Auto-pause for standard mode with hold loop when reaching end
-    if (anim.mode === 'standard' && anim.loopMode === 'hold') {
-        const rawPhase = t * rate;
-        if (rawPhase >= N - 1) pause();
-    }
+    // applyLoop('hold') clamps each tile to N-1 — no separate pause needed here.
 }
 
 /* ==========================================================
