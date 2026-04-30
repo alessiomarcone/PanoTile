@@ -1091,33 +1091,30 @@ function tickAnim(dt) {
    ========================================================== */
 
 function applySpatialShuffle(amount) {
-    // Spatial Shuffle: swap frameIndex values between tiles.
+    // Spatial Shuffle: swap the source crop positions (srcX/srcY) between tiles,
+    // rearranging which region of the video each tile displays.
     // amount (0-10): 0 = no shuffle, 10 = full shuffle.
-    // The shuffle intensity determines how many swaps to perform.
     const n = state.tiles.length;
     if (n < 2) return;
 
-    // Collect current frame indices
-    const indices = state.tiles.map(t => t.frameIndex);
+    // Work from original positions so repeated calls are idempotent
+    const positions = state.tiles.map(t => ({ srcX: t.origSrcX, srcY: t.origSrcY }));
 
-    // Fisher-Yates shuffle with intensity control
-    // amount=10 → full shuffle (n swaps), amount=5 → 50% swaps
     const swapCount = Math.round((amount / 10) * n);
 
     for (let s = 0; s < swapCount; s++) {
         const a = Math.floor(Math.random() * n);
         const b = Math.floor(Math.random() * n);
         if (a !== b) {
-            // Swap frame indices
-            const tmp = indices[a];
-            indices[a] = indices[b];
-            indices[b] = tmp;
+            const tmp = positions[a];
+            positions[a] = positions[b];
+            positions[b] = tmp;
         }
     }
 
-    // Apply shuffled indices back to tiles
     state.tiles.forEach((t, i) => {
-        t.frameIndex = indices[i];
+        t.srcX = positions[i].srcX;
+        t.srcY = positions[i].srcY;
     });
 
     if (!anim.playing) renderAll();
@@ -1359,15 +1356,26 @@ async function exportVideoWebCodecs() {
         fastStart: 'in-memory'
     });
 
-    // Setup VideoEncoder
+    // Codec level must match resolution — H.264 L3.0 only supports SD
+    const codecByRes = {
+        'preview': 'avc1.42001f', // Baseline L3.1 — up to 1280×720@30
+        '720':     'avc1.42001f', // Baseline L3.1
+        '1080':    'avc1.420028', // Baseline L4.0 — up to 1920×1080@30
+        '4k':      'avc1.420033', // Baseline L5.1 — up to 3840×2160@30
+    };
+    const codecString = codecByRes[res] || 'avc1.420028';
+
+    // Capture encoder errors via variable — throwing inside WebCodecs callbacks
+    // does NOT propagate to the outer async try/catch; it only closes the encoder.
+    let encoderError = null;
     let frameCount = 0;
     const encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-        error: (err) => { throw new Error(`VideoEncoder error: ${err.message}`); }
+        error: (err) => { encoderError = err; }
     });
 
     const encoderConfig = {
-        codec: 'avc1.42001e', // H.264 Baseline@L3.1
+        codec: codecString,
         width: expW,
         height: expH,
         bitrate: bitrate,
@@ -1383,7 +1391,8 @@ async function exportVideoWebCodecs() {
             await new Promise(r => setTimeout(r, 10));
         }
 
-        // Safety: if encoder was closed (e.g. by an error), abort
+        // Re-throw the real encoder error if one occurred
+        if (encoderError) throw encoderError;
         if (encoder.state === 'closed') {
             throw new Error('VideoEncoder closed unexpectedly during export');
         }
