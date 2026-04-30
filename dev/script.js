@@ -12,14 +12,6 @@ const MAX_SOURCE_FRAMES = 1800;   // 60s × 30fps — hard ceiling
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_CANVAS_DIM = 1000;
 
-// Per-frame RAM estimate (empirical: JPEG 0.72 quality ≈ these sizes)
-const RAM_PER_FRAME_BY_RES = {
-    'preview': 0.12,  // MB per frame, preview canvas
-    '720':     0.18,
-    '1080':    0.30,
-    '4k':      0.95
-};
-
 const state = {
     video: { width: 0, height: 0, duration: 0, name: '', size: 0, blobUrl: null, probe: null },
     range: { in: 0, out: 0 },
@@ -84,10 +76,6 @@ const el = {
     checkLoop: $('checkLoop'),
     selectRes: $('selectRes'),
     selectFps: $('selectFps'),
-    ramEstimate: $('ramEstimate'),
-    ramLabel: $('ramLabel'),
-    ramFill: $('ramFill'),
-    ramValue: $('ramValue'),
     btnExportPng: $('btnExportPng'),
     btnExportVideo: $('btnExportVideo'),
     selectMode: $('selectMode'),
@@ -375,7 +363,6 @@ async function extractFrames(probe) {
     enableControls();
     initProject();
     updateStatus();
-    updateRamEstimate();
 }
 
 function seekAndCapture(probe, tCtx, temp, targetTime) {
@@ -503,7 +490,6 @@ window.addEventListener('pointermove', (e) => {
         state.range.out = Math.min(state.video.duration, Math.max(state.range.in + MIN_RANGE_SEC, t));
     }
     renderRangeUI();
-    updateRamEstimate();
 });
 
 window.addEventListener('pointerup', () => {
@@ -514,8 +500,7 @@ window.addEventListener('pointerup', () => {
         const exportDur = parseFloat(el.inputDuration.value);
         // Allow export longer than range (time-dilation effect) — no auto-clamp.
         // Just update estimator; user triggers re-extraction via Regenerate.
-        updateRamEstimate();
-    }
+        }
 });
 
 /* ==========================================================
@@ -1207,29 +1192,6 @@ function enableControls() {
 }
 
 /* ==========================================================
-   RAM ESTIMATE
-   ========================================================== */
-
-function updateRamEstimate() {
-    const res = el.selectRes.value;
-    const fps = parseInt(el.selectFps.value, 10);
-    const dur = parseFloat(el.inputDuration.value) || 1;
-    const totalFrames = Math.ceil(dur * fps);
-    const mbPerFrame = RAM_PER_FRAME_BY_RES[res] || 0.3;
-    const totalMB = totalFrames * mbPerFrame;
-
-    el.ramLabel.innerText = `${totalFrames} frames @ ${res}`;
-    el.ramValue.innerText = totalMB < 100 ? `${totalMB.toFixed(0)} MB` : `${(totalMB / 1024).toFixed(1)} GB`;
-
-    const pct = Math.min(100, (totalMB / 512) * 100);
-    el.ramFill.style.width = pct + '%';
-
-    el.ramEstimate.classList.remove('warn', 'danger');
-    if (totalMB > 1024) el.ramEstimate.classList.add('danger');
-    else if (totalMB > 512) el.ramEstimate.classList.add('warn');
-}
-
-/* ==========================================================
    EXPORT ENGINE — Dual Path
    ========================================================== */
 
@@ -1680,12 +1642,9 @@ el.btnExportPng.addEventListener('click', exportPng);
 // Duration slider
 el.inputDuration.addEventListener('input', () => {
     el.durationValue.innerText = parseFloat(el.inputDuration.value).toFixed(1);
-    updateRamEstimate();
 });
 
 // Resolution / FPS
-el.selectRes.addEventListener('change', updateRamEstimate);
-el.selectFps.addEventListener('change', updateRamEstimate);
 
 // Loop checkbox → maps to loop mode dropdown
 el.checkLoop.addEventListener('change', () => {
@@ -1859,7 +1818,6 @@ function goToNextStep() {
 
 // Initial state
 updatePlayPauseUI();
-updateRamEstimate();
 
 // Tutorial: auto-show on first visit
 if (!localStorage.getItem('panotile_tutorial_seen')) {
