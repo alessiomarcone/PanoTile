@@ -543,6 +543,7 @@ function initProject() {
     const sW = crW / cols, sH = crH / rows;
     const oX = (vW - crW) / 2, oY = (vH - crH) / 2;
 
+    const _prevTileCount = state.tiles.length;
     state.tiles = [];
     for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
@@ -564,6 +565,15 @@ function initProject() {
             });
         }
     }
+    // Beat mapping warning: tile indices may be stale after grid change
+    if (_prevTileCount > 0 && state.tiles.length !== _prevTileCount) {
+        const _hasBeatTargets = Object.values(beatMap).some(m => m.targets.length > 0);
+        if (_hasBeatTargets) {
+            const _bw = $('beatWarning');
+            if (_bw) _bw.style.display = 'block';
+        }
+    }
+
     setMode(anim.mode);
     if (el.checkSpatialShuffle.checked && state.ready) {
         applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
@@ -710,6 +720,17 @@ function renderAll() {
             ctx.strokeStyle = 'rgba(0, 255, 163, 0.9)';
             ctx.lineWidth = 2;
             ctx.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+        }
+
+        // Beat flash overlays
+        const _beatNow = performance.now();
+        for (const t of state.tiles) {
+            const _flash = beatFlashes.get(t.id);
+            if (_flash && _beatNow < _flash.expiresAt) {
+                ctx.strokeStyle = BEAT_COLORS[_flash.instrument];
+                ctx.lineWidth = 2;
+                ctx.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+            }
         }
 
         if (el.checkGrid.checked) drawGrid();
@@ -961,6 +982,7 @@ function valueNoise3(x, y, z) {
 function setMode(mode) {
     if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
     anim.playing = false;
+    beatAudioPause();
     anim.mode = mode;
 
     if (mode === 'standard') {
@@ -1008,12 +1030,14 @@ function play() {
     anim.raf = requestAnimationFrame(loop);
     anim.playing = true;
     updatePlayPauseUI();
+    beatAudioPlay();
 }
 
 function pause() {
     if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
     anim.playing = false;
     updatePlayPauseUI();
+    beatAudioPause();
 }
 
 function togglePlayPause() {
@@ -1852,4 +1876,435 @@ document.querySelectorAll('.tutorial-dot').forEach(dot => {
         showTutorialStep(parseInt(dot.dataset.index));
     });
 });
+
+/* ==========================================================
+   BEAT ENGINE
+   ========================================================== */
+
+const BEAT_BANDS = {
+    kick:  { minHz: 40,    maxHz: 180,   threshold: 1.5 },
+    snare: { minHz: 180,   maxHz: 900,   threshold: 1.6 },
+    lead:  { minHz: 900,   maxHz: 4000,  threshold: 1.4 },
+    hihat: { minHz: 4000,  maxHz: 14000, threshold: 1.8 },
+};
+
+const BEAT_COLORS = {
+    kick:  '#ff6b35',
+    snare: '#ffd166',
+    lead:  '#06d6a0',
+    hihat: '#118ab2',
+};
+
+// Theoretical max energy per band at 44100 Hz, fftSize 2048 (binHz ≈ 21.5 Hz)
+const BEAT_METER_MAX = {
+    kick:  2040,    // ~8 bins × 255
+    snare: 8670,    // ~34 bins × 255
+    lead:  36975,   // ~145 bins × 255
+    hihat: 118575,  // ~465 bins × 255
+};
+
+const BEAT_COOLDOWN_MS  = 80;
+const BEAT_FLASH_MS     = 80;
+const BEAT_MIN_ENERGY   = 10;
+const BEAT_HISTORY_SIZE = 12;
+
+// Canvas beat flash tracking: tileId → { instrument, expiresAt }
+const beatFlashes = new Map();
+
+const beatEngine = {
+    audioCtx:    null,
+    analyser:    null,
+    source:      null,
+    audioBuffer: null,
+    audioFile:   null,
+    isPlaying:   false,
+    startTime:   0,
+    startOffset: 0,
+    rafId:       null,
+    lastHit:     { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    energyHist:  {
+        kick:  new Float32Array(BEAT_HISTORY_SIZE),
+        snare: new Float32Array(BEAT_HISTORY_SIZE),
+        lead:  new Float32Array(BEAT_HISTORY_SIZE),
+        hihat: new Float32Array(BEAT_HISTORY_SIZE),
+    },
+    histIdx:        0,
+    currentEnergy:  { kick: 0, snare: 0, lead: 0, hihat: 0 },
+};
+
+/* --- 3. beatMap + localStorage --- */
+
+let beatMap = beatLoadMap();
+
+function beatLoadMap() {
+    try {
+        const raw = localStorage.getItem('panotile_beat_map');
+        if (raw) {
+            const p = JSON.parse(raw);
+            const keys = ['kick', 'snare', 'lead', 'hihat'];
+            if (keys.every(k => p[k] && typeof p[k].enabled === 'boolean' && Array.isArray(p[k].targets))) {
+                return p;
+            }
+        }
+    } catch (_) {}
+    return {
+        kick:  { enabled: true,  targets: [] },
+        snare: { enabled: true,  targets: [] },
+        lead:  { enabled: false, targets: [] },
+        hihat: { enabled: true,  targets: [] },
+    };
+}
+
+function beatSaveMap() {
+    try { localStorage.setItem('panotile_beat_map', JSON.stringify(beatMap)); } catch (_) {}
+}
+
+/* --- 1. Audio engine --- */
+
+function beatEnsureCtx() {
+    if (beatEngine.audioCtx) return;
+    beatEngine.audioCtx = new AudioContext();
+    beatEngine.analyser = beatEngine.audioCtx.createAnalyser();
+    beatEngine.analyser.fftSize = 2048;
+    beatEngine.analyser.smoothingTimeConstant = 0.75;
+    // Connect analyser → destination once; sources connect to analyser per play
+    beatEngine.analyser.connect(beatEngine.audioCtx.destination);
+}
+
+async function beatLoadFile(file) {
+    try {
+        beatEnsureCtx();
+        const buf = await file.arrayBuffer();
+        beatEngine.audioBuffer = await beatEngine.audioCtx.decodeAudioData(buf);
+        beatEngine.audioFile   = file;
+        beatEngine.startOffset = 0;
+        const fn = $('beatFilename');
+        if (fn) fn.textContent = file.name;
+        const stopBtn = $('btnBeatStop');
+        if (stopBtn) stopBtn.disabled = false;
+        showToast(`Beat audio loaded: ${file.name}`, 'info');
+    } catch (err) {
+        showToast(`Audio error: ${err.message || 'Cannot decode file'}`);
+    }
+}
+
+/* --- 6. Sync: play/pause hooks (called from anim play/pause) --- */
+
+function beatAudioPlay() {
+    if (!beatEngine.audioCtx || !beatEngine.audioBuffer) return;
+    if (beatEngine.isPlaying) return;
+
+    if (beatEngine.audioCtx.state === 'suspended') beatEngine.audioCtx.resume();
+
+    const src = beatEngine.audioCtx.createBufferSource();
+    src.buffer = beatEngine.audioBuffer;
+    src.connect(beatEngine.analyser);
+
+    const offset = beatEngine.startOffset % beatEngine.audioBuffer.duration;
+    src.start(0, offset);
+    beatEngine.source    = src;
+    beatEngine.startTime = beatEngine.audioCtx.currentTime;
+    beatEngine.isPlaying = true;
+
+    src.onended = () => {
+        if (beatEngine.isPlaying) beatAudioStop();
+    };
+
+    beatStartAnalysis();
+}
+
+function beatAudioPause() {
+    if (!beatEngine.isPlaying) return;
+    beatEngine.startOffset += beatEngine.audioCtx.currentTime - beatEngine.startTime;
+    if (beatEngine.source) { try { beatEngine.source.stop(); } catch (_) {} beatEngine.source = null; }
+    beatEngine.audioCtx.suspend();
+    beatEngine.isPlaying = false;
+    beatStopAnalysis();
+}
+
+function beatAudioStop() {
+    if (beatEngine.source) { try { beatEngine.source.stop(); } catch (_) {} beatEngine.source = null; }
+    beatEngine.startOffset = 0;
+    beatEngine.isPlaying   = false;
+    beatStopAnalysis();
+    for (const k of Object.keys(BEAT_BANDS)) beatEngine.currentEnergy[k] = 0;
+    beatUpdateMeters();
+}
+
+/* --- 1. AnalyserNode loop --- */
+
+function beatStartAnalysis() {
+    if (beatEngine.rafId) return;
+    const loop = () => {
+        beatAnalyseFrame();
+        beatEngine.rafId = requestAnimationFrame(loop);
+    };
+    beatEngine.rafId = requestAnimationFrame(loop);
+}
+
+function beatStopAnalysis() {
+    if (beatEngine.rafId) { cancelAnimationFrame(beatEngine.rafId); beatEngine.rafId = null; }
+}
+
+/* --- 1+2. Energy per band + onset detection --- */
+
+function beatAnalyseFrame() {
+    if (!beatEngine.analyser || !beatEngine.isPlaying) return;
+
+    const bufLen    = beatEngine.analyser.frequencyBinCount; // 1024
+    const data      = new Uint8Array(bufLen);
+    beatEngine.analyser.getByteFrequencyData(data);
+
+    const sampleRate = beatEngine.audioCtx.sampleRate;
+    const binHz      = sampleRate / beatEngine.analyser.fftSize;
+    const hi         = beatEngine.histIdx % BEAT_HISTORY_SIZE;
+    const now        = performance.now();
+
+    for (const [instr, band] of Object.entries(BEAT_BANDS)) {
+        const minBin = Math.max(0, Math.floor(band.minHz / binHz));
+        const maxBin = Math.min(bufLen - 1, Math.ceil(band.maxHz / binHz));
+
+        let energy = 0;
+        for (let b = minBin; b <= maxBin; b++) energy += data[b];
+
+        beatEngine.energyHist[instr][hi] = energy;
+        beatEngine.currentEnergy[instr]  = energy;
+
+        // Sliding window average
+        let avg = 0;
+        for (let i = 0; i < BEAT_HISTORY_SIZE; i++) avg += beatEngine.energyHist[instr][i];
+        avg /= BEAT_HISTORY_SIZE;
+
+        // Onset detection with per-band cooldown
+        if (
+            energy > avg * band.threshold &&
+            energy > BEAT_MIN_ENERGY &&
+            now - beatEngine.lastHit[instr] > BEAT_COOLDOWN_MS
+        ) {
+            beatEngine.lastHit[instr] = now;
+            onBeatHit(instr);
+        }
+    }
+
+    beatEngine.histIdx++;
+    beatUpdateMeters();
+}
+
+/* --- 6. Trigger logic --- */
+
+function onBeatHit(instrument) {
+    if (!state.ready) return;
+    const mapping = beatMap[instrument];
+    if (!mapping.enabled) return;
+
+    for (const { tileIndex, scrubTime } of mapping.targets) {
+        // Edge case: index out of range after grid resize
+        if (tileIndex < 0 || tileIndex >= state.tiles.length) continue;
+        const tile = state.tiles[tileIndex];
+        if (!tile || tile.isPinned) continue; // pinned tiles always win
+
+        const fi = beatScrubToFrame(scrubTime);
+        tile.frameIndex = fi;
+
+        // In standard mode, update frameOffset so the scrub "sticks" across ticks
+        if (anim.mode === 'standard') {
+            const N        = state.totalFrames;
+            const rangeDur = Math.max(0.1, state.range.out - state.range.in);
+            const outFrame = anim.elapsed * (N / rangeDur);
+            const stFrame  = Math.floor(outFrame / anim.stutter) * anim.stutter;
+            tile.frameOffset = fi - stFrame;
+        }
+
+        beatFlashTile(tile, instrument);
+    }
+}
+
+function beatScrubToFrame(scrubTime) {
+    const N        = Math.max(1, state.totalFrames);
+    const rangeDur = Math.max(0.1, state.range.out - state.range.in);
+    const t        = Math.max(state.range.in, Math.min(state.range.out, scrubTime));
+    return Math.round((t - state.range.in) / rangeDur * (N - 1));
+}
+
+/* --- 7. Visual flash --- */
+
+function beatFlashTile(tile, instrument) {
+    beatFlashes.set(tile.id, { instrument, expiresAt: performance.now() + BEAT_FLASH_MS });
+    if (!anim.playing) renderAll();
+    setTimeout(() => {
+        beatFlashes.delete(tile.id);
+        if (!anim.playing) renderAll();
+    }, BEAT_FLASH_MS);
+}
+
+/* --- UI: energy meters --- */
+
+function beatUpdateMeters() {
+    const ids = { kick: 'meterKick', snare: 'meterSnare', lead: 'meterLead', hihat: 'meterHihat' };
+    for (const [instr, id] of Object.entries(ids)) {
+        const el = $(id);
+        if (!el) continue;
+        const pct = Math.min(100, (beatEngine.currentEnergy[instr] / BEAT_METER_MAX[instr]) * 100);
+        el.style.width = pct + '%';
+    }
+}
+
+/* --- 4+5. UI panel: mapping --- */
+
+function beatRenderMappingUI() {
+    const container = $('beatMappingUI');
+    if (!container) return;
+    container.innerHTML = '';
+
+    for (const instr of ['kick', 'snare', 'lead', 'hihat']) {
+        const mapping = beatMap[instr];
+        const block   = document.createElement('div');
+        block.className = 'beat-instr-block';
+
+        // Header: colored name + enabled toggle
+        const header  = document.createElement('div');
+        header.className = 'beat-instr-header';
+
+        const nameEl = document.createElement('span');
+        nameEl.className   = `beat-instr-name ${instr}`;
+        nameEl.textContent = instr.toUpperCase();
+
+        const togLabel  = document.createElement('label');
+        togLabel.className = 'toggle';
+        const togSpan  = document.createElement('span');
+        togSpan.textContent = 'enabled';
+        const togCb    = document.createElement('input');
+        togCb.type    = 'checkbox';
+        togCb.checked = mapping.enabled;
+        togCb.addEventListener('change', () => { beatMap[instr].enabled = togCb.checked; });
+        const togTrack = document.createElement('span');
+        togTrack.className = 'toggle-track';
+        togLabel.append(togSpan, togCb, togTrack);
+
+        header.append(nameEl, togLabel);
+        block.appendChild(header);
+
+        // Target rows
+        if (mapping.targets.length === 0) {
+            const empty = document.createElement('span');
+            empty.className   = 'beat-no-targets';
+            empty.textContent = '(no targets)';
+            block.appendChild(empty);
+        }
+        mapping.targets.forEach((target, idx) => {
+            block.appendChild(beatMakeTargetRow(instr, idx, target));
+        });
+
+        // Add button
+        const addBtn = document.createElement('button');
+        addBtn.className   = 'btn beat-btn-sm beat-add-row';
+        addBtn.textContent = '+ Add';
+        addBtn.addEventListener('click', () => {
+            beatMap[instr].targets.push({ tileIndex: 0, scrubTime: 0.0 });
+            beatRenderMappingUI();
+        });
+        block.appendChild(addBtn);
+
+        container.appendChild(block);
+    }
+}
+
+function beatMakeTargetRow(instr, idx, target) {
+    const row = document.createElement('div');
+    row.className = 'beat-target-row';
+
+    const lbl1 = document.createElement('span');
+    lbl1.className   = 'beat-target-label';
+    lbl1.textContent = 'Tile';
+
+    const tileIn = document.createElement('input');
+    tileIn.type  = 'number';
+    tileIn.className = 'field-input';
+    tileIn.style.cssText = 'width:46px;padding:3px 5px;font-size:11px;text-align:center;';
+    tileIn.min   = 0;
+    tileIn.step  = 1;
+    tileIn.value = target.tileIndex;
+    tileIn.addEventListener('change', () => {
+        beatMap[instr].targets[idx].tileIndex = Math.max(0, parseInt(tileIn.value, 10) || 0);
+    });
+
+    const arrow = document.createElement('span');
+    arrow.className   = 'beat-target-label';
+    arrow.textContent = '→';
+
+    const timeIn = document.createElement('input');
+    timeIn.type  = 'number';
+    timeIn.className = 'field-input';
+    timeIn.style.cssText = 'width:50px;padding:3px 5px;font-size:11px;text-align:center;';
+    timeIn.min   = 0;
+    timeIn.step  = 0.1;
+    timeIn.value = target.scrubTime;
+    timeIn.addEventListener('change', () => {
+        beatMap[instr].targets[idx].scrubTime = Math.max(0, parseFloat(timeIn.value) || 0);
+    });
+
+    const secLbl = document.createElement('span');
+    secLbl.className   = 'beat-target-label';
+    secLbl.textContent = 's';
+
+    const rmBtn = document.createElement('button');
+    rmBtn.className   = 'btn beat-btn-sm';
+    rmBtn.textContent = '×';
+    rmBtn.addEventListener('click', () => {
+        beatMap[instr].targets.splice(idx, 1);
+        beatRenderMappingUI();
+    });
+
+    row.append(lbl1, tileIn, arrow, timeIn, secLbl, rmBtn);
+    return row;
+}
+
+/* --- Event bindings --- */
+
+const _beatFileInput = $('beatFileInput');
+const _btnBeatLoad   = $('btnBeatLoad');
+const _btnBeatStop   = $('btnBeatStop');
+const _btnBeatSave   = $('btnBeatSave');
+const _btnBeatReset  = $('btnBeatReset');
+
+if (_beatFileInput) {
+    _beatFileInput.addEventListener('change', (e) => {
+        const f = e.target.files?.[0];
+        if (f) beatLoadFile(f);
+        e.target.value = '';
+    });
+}
+
+if (_btnBeatLoad) {
+    _btnBeatLoad.addEventListener('click', () => _beatFileInput && _beatFileInput.click());
+}
+
+if (_btnBeatStop) {
+    _btnBeatStop.addEventListener('click', () => {
+        beatAudioStop();
+    });
+}
+
+if (_btnBeatSave) {
+    _btnBeatSave.addEventListener('click', () => {
+        beatSaveMap();
+        showToast('Beat mapping saved', 'info');
+    });
+}
+
+if (_btnBeatReset) {
+    _btnBeatReset.addEventListener('click', () => {
+        beatMap = {
+            kick:  { enabled: true,  targets: [] },
+            snare: { enabled: true,  targets: [] },
+            lead:  { enabled: false, targets: [] },
+            hihat: { enabled: true,  targets: [] },
+        };
+        beatSaveMap();
+        beatRenderMappingUI();
+    });
+}
+
+/* --- 9. Init --- */
+beatRenderMappingUI();
 

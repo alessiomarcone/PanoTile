@@ -118,6 +118,44 @@
             </button>
         </div>
 
+        <!-- BEAT ENGINE -->
+        <div class="section" id="sectionBeatEngine">
+            <div class="section-title">BEAT ENGINE</div>
+            <div class="beat-file-row">
+                <button class="btn beat-load-btn" id="btnBeatLoad">▶ Load audio</button>
+                <input type="file" id="beatFileInput" accept="audio/*" style="display:none">
+                <span class="beat-filename" id="beatFilename">no file</span>
+                <button class="btn beat-stop-btn" id="btnBeatStop" disabled>■ Stop</button>
+            </div>
+            <div class="beat-meters">
+                <div class="beat-meter-row">
+                    <span class="beat-meter-label kick">KICK</span>
+                    <div class="beat-meter-track"><div class="beat-meter-fill kick" id="meterKick"></div></div>
+                </div>
+                <div class="beat-meter-row">
+                    <span class="beat-meter-label snare">SNARE</span>
+                    <div class="beat-meter-track"><div class="beat-meter-fill snare" id="meterSnare"></div></div>
+                </div>
+                <div class="beat-meter-row">
+                    <span class="beat-meter-label lead">LEAD</span>
+                    <div class="beat-meter-track"><div class="beat-meter-fill lead" id="meterLead"></div></div>
+                </div>
+                <div class="beat-meter-row">
+                    <span class="beat-meter-label hihat">HIHAT</span>
+                    <div class="beat-meter-track"><div class="beat-meter-fill hihat" id="meterHihat"></div></div>
+                </div>
+            </div>
+            <div class="beat-divider">── Mapping ──────────────</div>
+            <div id="beatMappingUI"></div>
+            <div class="btn-grid-2">
+                <button class="btn" id="btnBeatSave">Save mapping</button>
+                <button class="btn" id="btnBeatReset">Reset</button>
+            </div>
+            <div class="beat-warning" id="beatWarning" style="display:none">
+                ⚠ Grid changed, check beat mapping
+            </div>
+        </div>
+
         <!-- SPATIAL SHUFFLE -->
         <div class="section">
             <div class="section-title">SPATIAL SHUFFLE</div>
