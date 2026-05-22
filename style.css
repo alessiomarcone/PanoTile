@@ -1187,3 +1187,60 @@ input[type="range"].slider:disabled {
     font-family: var(--mono);
     padding: 2px 0;
 }
+
+.beat-compute-btn {
+    width: 100%;
+    margin-bottom: 4px;
+}
+
+.beat-preset-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-left: 8px;
+    margin-top: 2px;
+}
+
+.beat-preset-row {
+    display: flex;
+    gap: 6px;
+}
+
+.beat-preset-field {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    gap: 2px;
+}
+
+.beat-preset-select {
+    font-size: 10px;
+    padding: 3px 4px;
+    width: 100%;
+}
+
+.beat-preset-num {
+    width: 100% !important;
+    padding: 3px 5px !important;
+    font-size: 11px !important;
+    text-align: center !important;
+}
+
+.beat-preset-slider {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.beat-preset-shuffle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.beat-preset-amt {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+}

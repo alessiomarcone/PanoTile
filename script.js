@@ -565,12 +565,13 @@ function initProject() {
             });
         }
     }
-    // Beat mapping warning: tile indices may be stale after grid change
+    // Clear precomputed preset layouts when the grid changes (requires recompute)
     if (_prevTileCount > 0 && state.tiles.length !== _prevTileCount) {
-        const _hasBeatTargets = Object.values(beatMap).some(m => m.targets.length > 0);
-        if (_hasBeatTargets) {
+        const _hadLayouts = Object.keys(beatEngine.presetLayouts || {}).length > 0;
+        beatEngine.presetLayouts = {};
+        if (_hadLayouts) {
             const _bw = $('beatWarning');
-            if (_bw) _bw.style.display = 'block';
+            if (_bw) { _bw.textContent = '⚠ Grid changed — recompute presets'; _bw.style.display = 'block'; }
         }
     }
 
@@ -1071,6 +1072,9 @@ function tickAnim(dt) {
     const rangeDur = Math.max(0.1, state.range.out - state.range.in);
     const rate = N / rangeDur;
     const t = anim.elapsed;
+
+    // Continuous audio-reactive modulation (runs before frame computation)
+    beatApplyContinuous();
 
     // Compute the output frame number (continuous, not quantized)
     const outputFrame = t * rate;
@@ -1881,6 +1885,47 @@ document.querySelectorAll('.tutorial-dot').forEach(dot => {
    BEAT ENGINE
    ========================================================== */
 
+// Exponentially smoothed per-band energy (0–1) used for continuous modulation
+const beatSmooth = { kick: 0, snare: 0, lead: 0, hihat: 0 };
+
+function beatApplyContinuous() {
+    if (!beatEngine.isPlaying || !state.ready) return;
+
+    // Update smoothed energy for each band (EMA, α=0.15 ≈ ~40ms window at 60fps)
+    let sum = 0, count = 0;
+    for (const instr of Object.keys(BEAT_BANDS)) {
+        const raw = Math.min(1, beatEngine.currentEnergy[instr] / BEAT_METER_MAX[instr]);
+        beatSmooth[instr] = beatSmooth[instr] * 0.85 + raw * 0.15;
+        if (beatMap[instr].enabled) { sum += beatSmooth[instr]; count++; }
+    }
+    const intensity = count > 0 ? sum / count : 0;
+    if (intensity < 0.005) return;
+
+    const n = anim.tileOffsets.length;
+    const N = Math.max(1, state.totalFrames);
+
+    // Evolve tileOffsets proportionally to combined energy.
+    // At full intensity each offset drifts ±0.04 per frame — creates organic
+    // "boiling" of the tile pattern that scales with musical loudness.
+    const driftRate = intensity * 0.04;
+    for (let i = 0; i < n; i++) {
+        anim.tileOffsets[i] = ((anim.tileOffsets[i] + (Math.random() * 2 - 1) * driftRate) + 1) % 1;
+        // Also perturb tilePhases (used by perlin-flow mode)
+        anim.tilePhases[i]  = ((anim.tilePhases[i]  + (Math.random() * 2 - 1) * driftRate * N * 0.25) + N) % N;
+    }
+
+    // Kick drives stutter continuously: from 1 (silence) → preset.stutter (peak kick)
+    if (beatMap.kick.enabled) {
+        const maxS     = beatMap.kick.preset.stutter;
+        const newStutter = Math.max(1, Math.round(1 + beatSmooth.kick * (maxS - 1)));
+        if (anim.stutter !== newStutter) {
+            anim.stutter = newStutter;
+            if (el.inputStutter) el.inputStutter.value = newStutter;
+            if (el.stutterValue) el.stutterValue.innerText = newStutter;
+        }
+    }
+}
+
 const BEAT_BANDS = {
     kick:  { minHz: 40,    maxHz: 180,   threshold: 1.5 },
     snare: { minHz: 180,   maxHz: 900,   threshold: 1.6 },
@@ -1912,29 +1957,34 @@ const BEAT_HISTORY_SIZE = 12;
 const beatFlashes = new Map();
 
 const beatEngine = {
-    audioCtx:    null,
-    analyser:    null,
-    source:      null,
-    audioBuffer: null,
-    audioFile:   null,
-    isPlaying:   false,
-    startTime:   0,
-    startOffset: 0,
-    rafId:       null,
-    lastHit:     { kick: 0, snare: 0, lead: 0, hihat: 0 },
-    energyHist:  {
+    audioCtx:      null,
+    analyser:      null,
+    source:        null,
+    audioBuffer:   null,
+    audioFile:     null,
+    isPlaying:     false,
+    startTime:     0,
+    startOffset:   0,
+    rafId:         null,
+    lastHit:       { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    energyHist:    {
         kick:  new Float32Array(BEAT_HISTORY_SIZE),
         snare: new Float32Array(BEAT_HISTORY_SIZE),
         lead:  new Float32Array(BEAT_HISTORY_SIZE),
         hihat: new Float32Array(BEAT_HISTORY_SIZE),
     },
-    histIdx:        0,
-    currentEnergy:  { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    histIdx:       0,
+    currentEnergy: { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    presetLayouts: {},
 };
 
 /* --- 3. beatMap + localStorage --- */
 
 let beatMap = beatLoadMap();
+
+function beatDefaultPreset() {
+    return { cols: 4, rows: 4, mode: 'temporal-shuffle', stutter: 1, loopMode: 'wrap', shuffleEnabled: false, shuffleAmt: 5 };
+}
 
 function beatLoadMap() {
     try {
@@ -1942,16 +1992,16 @@ function beatLoadMap() {
         if (raw) {
             const p = JSON.parse(raw);
             const keys = ['kick', 'snare', 'lead', 'hihat'];
-            if (keys.every(k => p[k] && typeof p[k].enabled === 'boolean' && Array.isArray(p[k].targets))) {
+            if (keys.every(k => p[k] && typeof p[k].enabled === 'boolean' && p[k].preset && typeof p[k].preset.mode === 'string')) {
                 return p;
             }
         }
     } catch (_) {}
     return {
-        kick:  { enabled: true,  targets: [] },
-        snare: { enabled: true,  targets: [] },
-        lead:  { enabled: false, targets: [] },
-        hihat: { enabled: true,  targets: [] },
+        kick:  { enabled: true,  preset: beatDefaultPreset() },
+        snare: { enabled: true,  preset: { ...beatDefaultPreset(), mode: 'linear-lr', cols: 6, rows: 6 } },
+        lead:  { enabled: false, preset: { ...beatDefaultPreset(), mode: 'drunk',     stutter: 2 } },
+        hihat: { enabled: true,  preset: { ...beatDefaultPreset(), mode: 'perlin-flow', cols: 8, rows: 8 } },
     };
 }
 
@@ -2096,34 +2146,96 @@ function onBeatHit(instrument) {
     if (!state.ready) return;
     const mapping = beatMap[instrument];
     if (!mapping.enabled) return;
-
-    for (const { tileIndex, scrubTime } of mapping.targets) {
-        // Edge case: index out of range after grid resize
-        if (tileIndex < 0 || tileIndex >= state.tiles.length) continue;
-        const tile = state.tiles[tileIndex];
-        if (!tile || tile.isPinned) continue; // pinned tiles always win
-
-        const fi = beatScrubToFrame(scrubTime);
-        tile.frameIndex = fi;
-
-        // In standard mode, update frameOffset so the scrub "sticks" across ticks
-        if (anim.mode === 'standard') {
-            const N        = state.totalFrames;
-            const rangeDur = Math.max(0.1, state.range.out - state.range.in);
-            const outFrame = anim.elapsed * (N / rangeDur);
-            const stFrame  = Math.floor(outFrame / anim.stutter) * anim.stutter;
-            tile.frameOffset = fi - stFrame;
-        }
-
-        beatFlashTile(tile, instrument);
-    }
+    applyBeatPreset(instrument);
 }
 
-function beatScrubToFrame(scrubTime) {
-    const N        = Math.max(1, state.totalFrames);
-    const rangeDur = Math.max(0.1, state.range.out - state.range.in);
-    const t        = Math.max(state.range.in, Math.min(state.range.out, scrubTime));
-    return Math.round((t - state.range.in) / rangeDur * (N - 1));
+function applyBeatPreset(instr) {
+    if (!state.ready) return;
+    const p = beatMap[instr].preset;
+
+    // Switch anim mode in-place — do NOT call setMode() (it stops playback)
+    anim.mode = p.mode;
+    el.selectMode.value = p.mode;
+    canvas.style.cursor = p.mode === 'standard' ? 'ew-resize' : 'default';
+
+    // Loop mode + stutter
+    anim.loopMode = p.loopMode;
+    if (el.selectLoop) el.selectLoop.value = p.loopMode;
+    anim.stutter = p.stutter;
+    if (el.inputStutter) el.inputStutter.value = p.stutter;
+    if (el.stutterValue) el.stutterValue.innerText = p.stutter;
+
+    // Grid swap via precomputed layout (if available)
+    const layout = beatEngine.presetLayouts[instr];
+    if (layout) {
+        state.tiles = layout.map(t => ({ ...t, frameIndex: 0, frameOffset: 0, isPinned: false }));
+        el.inputCols.value = p.cols;
+        el.inputRows.value = p.rows;
+    }
+
+    // Re-seed tileOffsets/tilePhases for the (possibly new) tile count
+    const n = state.tiles.length;
+    const N = state.totalFrames;
+    const rng = _seededRng(Date.now() | 0);
+    anim.tileOffsets = Array.from({ length: n }, () => rng());
+    anim.tilePhases  = anim.tileOffsets.map(r => r * N);
+
+    // Spatial shuffle
+    el.checkSpatialShuffle.checked = p.shuffleEnabled;
+    el.inputSpatialAmt.value = p.shuffleAmt;
+    if (el.spatialAmtValue) el.spatialAmtValue.innerText = p.shuffleAmt;
+    if (p.shuffleEnabled) applySpatialShuffle(p.shuffleAmt);
+    else resetSpatialShuffle();
+
+    // Flash all tiles for visual beat feedback
+    for (const tile of state.tiles) beatFlashTile(tile, instr);
+
+    updateStatus();
+}
+
+function beatComputePresets() {
+    if (!state.ready) { showToast('Load a video first'); return; }
+
+    beatEngine.presetLayouts = {};
+    const vW = state.video.width;
+    const vH = state.video.height;
+    const vRatio = vW / vH;
+    const s  = Math.min(1, MAX_CANVAS_DIM / vW, MAX_CANVAS_DIM / vH);
+    const cW = Math.round(vW * s);
+    const cH = Math.round(vH * s);
+    const cRatio = cW / cH;
+    let crW = vW, crH = vH;
+    if (cRatio > vRatio) crH = vW / cRatio;
+    else crW = vH * cRatio;
+
+    for (const [instr, mapping] of Object.entries(beatMap)) {
+        const p    = mapping.preset;
+        const cols = Math.max(1, Math.min(30, p.cols));
+        const rows = Math.max(1, Math.min(30, p.rows));
+        const sW   = crW / cols;
+        const sH   = crH / rows;
+        const oX   = (vW - crW) / 2;
+        const oY   = (vH - crH) / 2;
+        const tiles = [];
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                tiles.push({
+                    x: c * (cW / cols), y: r * (cH / rows),
+                    w: cW / cols,       h: cH / rows,
+                    srcX: oX + c * sW,  srcY: oY + r * sH,
+                    origSrcX: oX + c * sW, origSrcY: oY + r * sH,
+                    srcW: sW, srcH: sH,
+                    frameIndex: 0, frameOffset: 0,
+                    isPinned: false, id: r * cols + c
+                });
+            }
+        }
+        beatEngine.presetLayouts[instr] = tiles;
+    }
+
+    const bw = $('beatWarning');
+    if (bw) bw.style.display = 'none';
+    showToast('Presets computed — beat engine ready', 'info');
 }
 
 /* --- 7. Visual flash --- */
@@ -2162,101 +2274,152 @@ function beatRenderMappingUI() {
         block.className = 'beat-instr-block';
 
         // Header: colored name + enabled toggle
-        const header  = document.createElement('div');
+        const header = document.createElement('div');
         header.className = 'beat-instr-header';
-
         const nameEl = document.createElement('span');
         nameEl.className   = `beat-instr-name ${instr}`;
         nameEl.textContent = instr.toUpperCase();
-
-        const togLabel  = document.createElement('label');
+        const togLabel = document.createElement('label');
         togLabel.className = 'toggle';
         const togSpan  = document.createElement('span');
         togSpan.textContent = 'enabled';
-        const togCb    = document.createElement('input');
+        const togCb = document.createElement('input');
         togCb.type    = 'checkbox';
         togCb.checked = mapping.enabled;
         togCb.addEventListener('change', () => { beatMap[instr].enabled = togCb.checked; });
         const togTrack = document.createElement('span');
         togTrack.className = 'toggle-track';
         togLabel.append(togSpan, togCb, togTrack);
-
         header.append(nameEl, togLabel);
         block.appendChild(header);
 
-        // Target rows
-        if (mapping.targets.length === 0) {
-            const empty = document.createElement('span');
-            empty.className   = 'beat-no-targets';
-            empty.textContent = '(no targets)';
-            block.appendChild(empty);
-        }
-        mapping.targets.forEach((target, idx) => {
-            block.appendChild(beatMakeTargetRow(instr, idx, target));
-        });
-
-        // Add button
-        const addBtn = document.createElement('button');
-        addBtn.className   = 'btn beat-btn-sm beat-add-row';
-        addBtn.textContent = '+ Add';
-        addBtn.addEventListener('click', () => {
-            beatMap[instr].targets.push({ tileIndex: 0, scrubTime: 0.0 });
-            beatRenderMappingUI();
-        });
-        block.appendChild(addBtn);
-
+        // Preset editor
+        block.appendChild(beatMakePresetEditor(instr, mapping.preset));
         container.appendChild(block);
     }
 }
 
-function beatMakeTargetRow(instr, idx, target) {
-    const row = document.createElement('div');
-    row.className = 'beat-target-row';
+function beatMakePresetEditor(instr, p) {
+    const wrap = document.createElement('div');
+    wrap.className = 'beat-preset-fields';
 
-    const lbl1 = document.createElement('span');
-    lbl1.className   = 'beat-target-label';
-    lbl1.textContent = 'Tile';
+    // Row 1: Mode + Loop
+    const row1 = document.createElement('div');
+    row1.className = 'beat-preset-row';
 
-    const tileIn = document.createElement('input');
-    tileIn.type  = 'number';
-    tileIn.className = 'field-input';
-    tileIn.style.cssText = 'width:46px;padding:3px 5px;font-size:11px;text-align:center;';
-    tileIn.min   = 0;
-    tileIn.step  = 1;
-    tileIn.value = target.tileIndex;
-    tileIn.addEventListener('change', () => {
-        beatMap[instr].targets[idx].tileIndex = Math.max(0, parseInt(tileIn.value, 10) || 0);
+    const modeField = document.createElement('div');
+    modeField.className = 'beat-preset-field';
+    const modeLbl = document.createElement('span');
+    modeLbl.className = 'beat-target-label';
+    modeLbl.textContent = 'Mode';
+    const modeSel = document.createElement('select');
+    modeSel.className = 'field-select beat-preset-select';
+    [['standard','Standard'],['linear-lr','→'],['linear-rl','←'],['temporal-shuffle','Shuffle'],['drunk','Drunk'],['perlin-flow','Perlin']].forEach(([v, t]) => {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = t; if (v === p.mode) o.selected = true;
+        modeSel.appendChild(o);
     });
+    modeSel.addEventListener('change', () => { beatMap[instr].preset.mode = modeSel.value; });
+    modeField.append(modeLbl, modeSel);
 
-    const arrow = document.createElement('span');
-    arrow.className   = 'beat-target-label';
-    arrow.textContent = '→';
-
-    const timeIn = document.createElement('input');
-    timeIn.type  = 'number';
-    timeIn.className = 'field-input';
-    timeIn.style.cssText = 'width:50px;padding:3px 5px;font-size:11px;text-align:center;';
-    timeIn.min   = 0;
-    timeIn.step  = 0.1;
-    timeIn.value = target.scrubTime;
-    timeIn.addEventListener('change', () => {
-        beatMap[instr].targets[idx].scrubTime = Math.max(0, parseFloat(timeIn.value) || 0);
+    const loopField = document.createElement('div');
+    loopField.className = 'beat-preset-field';
+    const loopLbl = document.createElement('span');
+    loopLbl.className = 'beat-target-label';
+    loopLbl.textContent = 'Loop';
+    const loopSel = document.createElement('select');
+    loopSel.className = 'field-select beat-preset-select';
+    [['wrap','Wrap'],['pingpong','Ping'],['hold','Hold']].forEach(([v, t]) => {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = t; if (v === p.loopMode) o.selected = true;
+        loopSel.appendChild(o);
     });
+    loopSel.addEventListener('change', () => { beatMap[instr].preset.loopMode = loopSel.value; });
+    loopField.append(loopLbl, loopSel);
+    row1.append(modeField, loopField);
 
-    const secLbl = document.createElement('span');
-    secLbl.className   = 'beat-target-label';
-    secLbl.textContent = 's';
-
-    const rmBtn = document.createElement('button');
-    rmBtn.className   = 'btn beat-btn-sm';
-    rmBtn.textContent = '×';
-    rmBtn.addEventListener('click', () => {
-        beatMap[instr].targets.splice(idx, 1);
-        beatRenderMappingUI();
+    // Stutter slider
+    const stutterWrap = document.createElement('div');
+    stutterWrap.className = 'beat-preset-slider';
+    const stutterHead = document.createElement('div');
+    stutterHead.className = 'slider-head';
+    const stutterLbl = document.createElement('span');
+    stutterLbl.className = 'field-label';
+    stutterLbl.textContent = 'Stutter';
+    const stutterVal = document.createElement('span');
+    stutterVal.className = 'slider-value';
+    stutterVal.textContent = p.stutter + 'x';
+    stutterHead.append(stutterLbl, stutterVal);
+    const stutterSlider = document.createElement('input');
+    stutterSlider.type = 'range'; stutterSlider.className = 'slider';
+    stutterSlider.min = 1; stutterSlider.max = 6; stutterSlider.step = 1; stutterSlider.value = p.stutter;
+    stutterSlider.addEventListener('input', () => {
+        beatMap[instr].preset.stutter = parseInt(stutterSlider.value);
+        stutterVal.textContent = stutterSlider.value + 'x';
     });
+    stutterWrap.append(stutterHead, stutterSlider);
 
-    row.append(lbl1, tileIn, arrow, timeIn, secLbl, rmBtn);
-    return row;
+    // Row 2: Cols + Rows
+    const row2 = document.createElement('div');
+    row2.className = 'beat-preset-row';
+
+    const colsField = document.createElement('div');
+    colsField.className = 'beat-preset-field';
+    const colsLbl = document.createElement('span');
+    colsLbl.className = 'beat-target-label';
+    colsLbl.textContent = 'Cols';
+    const colsIn = document.createElement('input');
+    colsIn.type = 'number'; colsIn.className = 'field-input beat-preset-num';
+    colsIn.min = 1; colsIn.max = 30; colsIn.value = p.cols;
+    colsIn.addEventListener('change', () => { beatMap[instr].preset.cols = Math.max(1, Math.min(30, parseInt(colsIn.value) || 1)); });
+    colsField.append(colsLbl, colsIn);
+
+    const rowsField = document.createElement('div');
+    rowsField.className = 'beat-preset-field';
+    const rowsLbl = document.createElement('span');
+    rowsLbl.className = 'beat-target-label';
+    rowsLbl.textContent = 'Rows';
+    const rowsIn = document.createElement('input');
+    rowsIn.type = 'number'; rowsIn.className = 'field-input beat-preset-num';
+    rowsIn.min = 1; rowsIn.max = 30; rowsIn.value = p.rows;
+    rowsIn.addEventListener('change', () => { beatMap[instr].preset.rows = Math.max(1, Math.min(30, parseInt(rowsIn.value) || 1)); });
+    rowsField.append(rowsLbl, rowsIn);
+    row2.append(colsField, rowsField);
+
+    // Shuffle toggle + amount
+    const shuffleWrap = document.createElement('div');
+    shuffleWrap.className = 'beat-preset-shuffle';
+    const shuffleTogLabel = document.createElement('label');
+    shuffleTogLabel.className = 'toggle';
+    shuffleTogLabel.style.fontSize = '10px';
+    const shuffleTxt = document.createElement('span');
+    shuffleTxt.textContent = 'Shuffle';
+    const shuffleCb = document.createElement('input');
+    shuffleCb.type = 'checkbox'; shuffleCb.checked = p.shuffleEnabled;
+    const shuffleTrack = document.createElement('span');
+    shuffleTrack.className = 'toggle-track';
+    shuffleTogLabel.append(shuffleTxt, shuffleCb, shuffleTrack);
+
+    const amtWrap = document.createElement('div');
+    amtWrap.className = 'beat-preset-amt';
+    amtWrap.style.display = p.shuffleEnabled ? 'flex' : 'none';
+    const amtLbl = document.createElement('span');
+    amtLbl.className = 'beat-target-label';
+    amtLbl.textContent = 'Amt';
+    const amtIn = document.createElement('input');
+    amtIn.type = 'number'; amtIn.className = 'field-input beat-preset-num';
+    amtIn.min = 0; amtIn.max = 10; amtIn.value = p.shuffleAmt;
+    amtIn.addEventListener('change', () => { beatMap[instr].preset.shuffleAmt = Math.max(0, Math.min(10, parseInt(amtIn.value) || 0)); });
+    amtWrap.append(amtLbl, amtIn);
+
+    shuffleCb.addEventListener('change', () => {
+        beatMap[instr].preset.shuffleEnabled = shuffleCb.checked;
+        amtWrap.style.display = shuffleCb.checked ? 'flex' : 'none';
+    });
+    shuffleWrap.append(shuffleTogLabel, amtWrap);
+
+    wrap.append(row1, stutterWrap, row2, shuffleWrap);
+    return wrap;
 }
 
 /* --- Event bindings --- */
@@ -2295,14 +2458,20 @@ if (_btnBeatSave) {
 if (_btnBeatReset) {
     _btnBeatReset.addEventListener('click', () => {
         beatMap = {
-            kick:  { enabled: true,  targets: [] },
-            snare: { enabled: true,  targets: [] },
-            lead:  { enabled: false, targets: [] },
-            hihat: { enabled: true,  targets: [] },
+            kick:  { enabled: true,  preset: beatDefaultPreset() },
+            snare: { enabled: true,  preset: { ...beatDefaultPreset(), mode: 'linear-lr',   cols: 6, rows: 6 } },
+            lead:  { enabled: false, preset: { ...beatDefaultPreset(), mode: 'drunk',        stutter: 2 } },
+            hihat: { enabled: true,  preset: { ...beatDefaultPreset(), mode: 'perlin-flow',  cols: 8, rows: 8 } },
         };
+        beatEngine.presetLayouts = {};
         beatSaveMap();
         beatRenderMappingUI();
     });
+}
+
+const _btnBeatCompute = $('btnBeatCompute');
+if (_btnBeatCompute) {
+    _btnBeatCompute.addEventListener('click', beatComputePresets);
 }
 
 /* --- 9. Init --- */
