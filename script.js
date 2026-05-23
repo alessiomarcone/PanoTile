@@ -543,6 +543,7 @@ function initProject() {
     const sW = crW / cols, sH = crH / rows;
     const oX = (vW - crW) / 2, oY = (vH - crH) / 2;
 
+    const _prevTileCount = state.tiles.length;
     state.tiles = [];
     for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
@@ -564,10 +565,21 @@ function initProject() {
             });
         }
     }
+    // Clear precomputed preset layouts when the grid changes (requires recompute)
+    if (_prevTileCount > 0 && state.tiles.length !== _prevTileCount) {
+        const _hadLayouts = Object.keys(beatEngine.presetLayouts || {}).length > 0;
+        beatEngine.presetLayouts = {};
+        if (_hadLayouts) {
+            const _bw = $('beatWarning');
+            if (_bw) { _bw.textContent = '⚠ Grid changed — recompute presets'; _bw.style.display = 'block'; }
+        }
+    }
+
     setMode(anim.mode);
     if (el.checkSpatialShuffle.checked && state.ready) {
         applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
     }
+    if (beatEngine.audioBuffer) beatComputePresets(true);  // recompute if audio loaded
     updateStatus();
 }
 
@@ -710,6 +722,17 @@ function renderAll() {
             ctx.strokeStyle = 'rgba(0, 255, 163, 0.9)';
             ctx.lineWidth = 2;
             ctx.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+        }
+
+        // Beat flash overlays
+        const _beatNow = performance.now();
+        for (const t of state.tiles) {
+            const _flash = beatFlashes.get(t.id);
+            if (_flash && _beatNow < _flash.expiresAt) {
+                ctx.strokeStyle = BEAT_COLORS[_flash.instrument];
+                ctx.lineWidth = 2;
+                ctx.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+            }
         }
 
         if (el.checkGrid.checked) drawGrid();
@@ -961,6 +984,7 @@ function valueNoise3(x, y, z) {
 function setMode(mode) {
     if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
     anim.playing = false;
+    beatAudioPause();
     anim.mode = mode;
 
     if (mode === 'standard') {
@@ -1008,12 +1032,14 @@ function play() {
     anim.raf = requestAnimationFrame(loop);
     anim.playing = true;
     updatePlayPauseUI();
+    beatAudioPlay();
 }
 
 function pause() {
     if (anim.raf) { cancelAnimationFrame(anim.raf); anim.raf = null; }
     anim.playing = false;
     updatePlayPauseUI();
+    beatAudioPause();
 }
 
 function togglePlayPause() {
@@ -1061,6 +1087,10 @@ function tickAnim(dt) {
             anim.tileOffsets, anim.tilePhases, i
         );
     });
+
+    // Continuous audio-reactive modulation — runs AFTER base frame computation
+    // so frame jitter adds directly on top of the pipeline result.
+    beatApplyContinuous();
     // applyLoop('hold') clamps each tile to N-1 — no separate pause needed here.
 }
 
@@ -1852,4 +1882,886 @@ document.querySelectorAll('.tutorial-dot').forEach(dot => {
         showTutorialStep(parseInt(dot.dataset.index));
     });
 });
+
+/* ==========================================================
+   BEAT ENGINE
+   ========================================================== */
+
+// Envelope follower per-band: attack fast, release slow — tracks macro song sections
+const beatEnv = { kick: 0, snare: 0, lead: 0, hihat: 0 };
+// α values at 60fps: attack ~80ms, release ~1.2s
+const BEAT_ENV_ATTACK  = 0.2;
+const BEAT_ENV_RELEASE = 0.008;
+
+// Beat Script: offline-analysed timeline + scripted playback
+const beatScript = {
+    data:       null,   // JSON data loaded/generated
+    beatIdx:    0,      // index of next beat to process
+    sectionIdx: 0,      // index of next section to process
+    macro: {
+        intensity:  1.0,        // 0.1–2.0: scales stutter + drift
+        tempoMult:  1,          // 1, 2, 4: skip beats (1=all, 2=every other, 4=every 4th)
+        style:      'balanced', // 'minimal' | 'balanced' | 'chaos' | 'cinematic'
+        threshold:  0.3,        // 0–1: min section intensity to trigger preset change
+    },
+};
+
+const BEAT_STYLES = {
+    minimal: {
+        kick:  { cols: 2, rows: 2, mode: 'linear-lr',        stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 0 },
+        snare: { cols: 3, rows: 3, mode: 'standard',          stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 0 },
+        lead:  { cols: 4, rows: 4, mode: 'linear-lr',         stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 0 },
+        hihat: { cols: 4, rows: 4, mode: 'temporal-shuffle',  stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 3 },
+    },
+    balanced: null, // uses beatMap presets as-is
+    chaos: {
+        kick:  { cols: 2, rows: 2, mode: 'drunk',             stutter: 4, loopMode: 'wrap',     shuffleEnabled: true,  shuffleAmt: 9 },
+        snare: { cols: 5, rows: 5, mode: 'temporal-shuffle',  stutter: 2, loopMode: 'pingpong', shuffleEnabled: true,  shuffleAmt: 8 },
+        lead:  { cols: 7, rows: 7, mode: 'drunk',             stutter: 3, loopMode: 'wrap',     shuffleEnabled: true,  shuffleAmt: 6 },
+        hihat: { cols: 9, rows: 9, mode: 'perlin-flow',       stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 0 },
+    },
+    cinematic: {
+        kick:  { cols: 2, rows: 2, mode: 'perlin-flow',       stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 0 },
+        snare: { cols: 3, rows: 3, mode: 'linear-lr',         stutter: 2, loopMode: 'pingpong', shuffleEnabled: false, shuffleAmt: 0 },
+        lead:  { cols: 4, rows: 4, mode: 'perlin-flow',       stutter: 1, loopMode: 'wrap',     shuffleEnabled: true,  shuffleAmt: 4 },
+        hihat: { cols: 6, rows: 6, mode: 'linear-rl',         stutter: 1, loopMode: 'pingpong', shuffleEnabled: false, shuffleAmt: 0 },
+    },
+};
+
+function beatApplyContinuous() {
+    if (!beatEngine.isPlaying || !state.ready) return;
+
+    // Attack/release envelope follower — follows macro energy, not micro transients
+    let sum = 0, count = 0;
+    for (const instr of Object.keys(BEAT_BANDS)) {
+        const raw = Math.min(1, beatEngine.currentEnergy[instr] / BEAT_METER_MAX[instr]);
+        const alpha = raw > beatEnv[instr] ? BEAT_ENV_ATTACK : BEAT_ENV_RELEASE;
+        beatEnv[instr] = beatEnv[instr] * (1 - alpha) + raw * alpha;
+        if (beatMap[instr].enabled) { sum += beatEnv[instr]; count++; }
+    }
+    const intensity = count > 0 ? sum / count : 0;
+    if (intensity < 0.005) return;
+
+    const n = anim.tileOffsets.length;
+    const N = Math.max(1, state.totalFrames);
+
+    // TileOffset drift proportional to macro envelope × intensity multiplier.
+    const driftRate = intensity * 0.07 * beatScript.macro.intensity;
+    if (driftRate > 0.001 && n > 0) {
+        for (let i = 0; i < n; i++) {
+            anim.tileOffsets[i] = ((anim.tileOffsets[i] + (Math.random() * 2 - 1) * driftRate) + 1) % 1;
+            anim.tilePhases[i]  = ((anim.tilePhases[i]  + (Math.random() * 2 - 1) * driftRate * N * 0.3) + N) % N;
+        }
+    }
+
+    // Kick envelope drives stutter: 1 at silence → preset.stutter at section peak
+    if (beatMap.kick.enabled) {
+        const maxS = beatMap.kick.preset.stutter;
+        const newStutter = Math.max(1, Math.round(1 + beatEnv.kick * (maxS - 1)));
+        if (anim.stutter !== newStutter) {
+            anim.stutter = newStutter;
+            if (el.inputStutter) el.inputStutter.value = newStutter;
+            if (el.stutterValue) el.stutterValue.innerText = newStutter;
+        }
+    }
+}
+
+const BEAT_BANDS = {
+    kick:  { minHz: 40,    maxHz: 180,   threshold: 1.5 },
+    snare: { minHz: 180,   maxHz: 900,   threshold: 1.6 },
+    lead:  { minHz: 900,   maxHz: 4000,  threshold: 1.4 },
+    hihat: { minHz: 4000,  maxHz: 14000, threshold: 1.8 },
+};
+
+const BEAT_COLORS = {
+    kick:  '#ff6b35',
+    snare: '#ffd166',
+    lead:  '#06d6a0',
+    hihat: '#118ab2',
+};
+
+// Theoretical max energy per band at 44100 Hz, fftSize 2048 (binHz ≈ 21.5 Hz)
+const BEAT_METER_MAX = {
+    kick:  2040,    // ~8 bins × 255
+    snare: 8670,    // ~34 bins × 255
+    lead:  36975,   // ~145 bins × 255
+    hihat: 118575,  // ~465 bins × 255
+};
+
+const BEAT_COOLDOWN_MS  = 80;
+const BEAT_FLASH_MS     = 80;
+const BEAT_MIN_ENERGY   = 10;
+const BEAT_HISTORY_SIZE = 12;
+
+// Canvas beat flash tracking: tileId → { instrument, expiresAt }
+const beatFlashes = new Map();
+
+const beatEngine = {
+    audioCtx:      null,
+    analyser:      null,
+    source:        null,
+    audioBuffer:   null,
+    audioFile:     null,
+    isPlaying:     false,
+    startTime:     0,
+    startOffset:   0,
+    rafId:         null,
+    lastHit:       { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    energyHist:    {
+        kick:  new Float32Array(BEAT_HISTORY_SIZE),
+        snare: new Float32Array(BEAT_HISTORY_SIZE),
+        lead:  new Float32Array(BEAT_HISTORY_SIZE),
+        hihat: new Float32Array(BEAT_HISTORY_SIZE),
+    },
+    histIdx:       0,
+    currentEnergy: { kick: 0, snare: 0, lead: 0, hihat: 0 },
+    presetLayouts: {},
+};
+
+/* --- 3. beatMap + localStorage --- */
+
+let beatMap = beatLoadMap();
+
+const BEAT_MAP_STORAGE_KEY = 'panotile_beat_map_v2';
+
+function beatDefaultPresets() {
+    return {
+        kick:  { enabled: true,  preset: { cols: 2, rows: 2, mode: 'drunk',            stutter: 3, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 5 } },
+        snare: { enabled: true,  preset: { cols: 4, rows: 4, mode: 'temporal-shuffle', stutter: 1, loopMode: 'wrap',     shuffleEnabled: true,  shuffleAmt: 8 } },
+        lead:  { enabled: false, preset: { cols: 6, rows: 6, mode: 'linear-lr',        stutter: 2, loopMode: 'pingpong', shuffleEnabled: false, shuffleAmt: 5 } },
+        hihat: { enabled: true,  preset: { cols: 8, rows: 8, mode: 'perlin-flow',      stutter: 1, loopMode: 'wrap',     shuffleEnabled: false, shuffleAmt: 5 } },
+    };
+}
+
+function beatLoadMap() {
+    try {
+        const raw = localStorage.getItem(BEAT_MAP_STORAGE_KEY);
+        if (raw) {
+            const p = JSON.parse(raw);
+            const keys = ['kick', 'snare', 'lead', 'hihat'];
+            if (keys.every(k => p[k] && typeof p[k].enabled === 'boolean' && p[k].preset && typeof p[k].preset.mode === 'string')) {
+                return p;
+            }
+        }
+    } catch (_) {}
+    return beatDefaultPresets();
+}
+
+function beatSaveMap() {
+    try { localStorage.setItem(BEAT_MAP_STORAGE_KEY, JSON.stringify(beatMap)); } catch (_) {}
+}
+
+/* --- 1. Audio engine --- */
+
+function beatEnsureCtx() {
+    if (beatEngine.audioCtx) return;
+    beatEngine.audioCtx = new AudioContext();
+    beatEngine.analyser = beatEngine.audioCtx.createAnalyser();
+    beatEngine.analyser.fftSize = 2048;
+    beatEngine.analyser.smoothingTimeConstant = 0.75;
+    // Connect analyser → destination once; sources connect to analyser per play
+    beatEngine.analyser.connect(beatEngine.audioCtx.destination);
+}
+
+async function beatLoadFile(file) {
+    try {
+        beatEnsureCtx();
+        const buf = await file.arrayBuffer();
+        beatEngine.audioBuffer = await beatEngine.audioCtx.decodeAudioData(buf);
+        beatEngine.audioFile   = file;
+        beatEngine.startOffset = 0;
+        const fn = $('beatFilename');
+        if (fn) fn.textContent = file.name;
+        const stopBtn = $('btnBeatStop');
+        if (stopBtn) stopBtn.disabled = false;
+        showToast(`Beat audio loaded: ${file.name}`, 'info');
+        beatComputePresets(true);  // auto-compute if video is already loaded
+    } catch (err) {
+        showToast(`Audio error: ${err.message || 'Cannot decode file'}`);
+    }
+}
+
+/* --- 6. Sync: play/pause hooks (called from anim play/pause) --- */
+
+function beatAudioPlay() {
+    if (!beatEngine.audioCtx || !beatEngine.audioBuffer) return;
+    if (beatEngine.isPlaying) return;
+
+    if (beatEngine.audioCtx.state === 'suspended') beatEngine.audioCtx.resume();
+
+    const src = beatEngine.audioCtx.createBufferSource();
+    src.buffer = beatEngine.audioBuffer;
+    src.connect(beatEngine.analyser);
+
+    const offset = beatEngine.startOffset % beatEngine.audioBuffer.duration;
+    src.start(0, offset);
+    beatEngine.source    = src;
+    beatEngine.startTime = beatEngine.audioCtx.currentTime;
+    beatEngine.isPlaying = true;
+
+    src.onended = () => {
+        if (beatEngine.isPlaying) beatAudioStop();
+    };
+
+    beatStartAnalysis();
+}
+
+function beatAudioPause() {
+    if (!beatEngine.isPlaying) return;
+    beatEngine.startOffset += beatEngine.audioCtx.currentTime - beatEngine.startTime;
+    if (beatEngine.source) { try { beatEngine.source.stop(); } catch (_) {} beatEngine.source = null; }
+    beatEngine.audioCtx.suspend();
+    beatEngine.isPlaying = false;
+    beatStopAnalysis();
+}
+
+function beatAudioStop() {
+    if (beatEngine.source) { try { beatEngine.source.stop(); } catch (_) {} beatEngine.source = null; }
+    beatEngine.startOffset = 0;
+    beatEngine.isPlaying   = false;
+    beatStopAnalysis();
+    for (const k of Object.keys(BEAT_BANDS)) beatEngine.currentEnergy[k] = 0;
+    beatUpdateMeters();
+}
+
+/* --- 1. AnalyserNode loop --- */
+
+function beatStartAnalysis() {
+    if (beatEngine.rafId) return;
+    const loop = () => {
+        beatAnalyseFrame();
+        beatEngine.rafId = requestAnimationFrame(loop);
+    };
+    beatEngine.rafId = requestAnimationFrame(loop);
+}
+
+function beatStopAnalysis() {
+    if (beatEngine.rafId) { cancelAnimationFrame(beatEngine.rafId); beatEngine.rafId = null; }
+}
+
+/* --- 1+2. Energy per band + onset detection --- */
+
+function beatAnalyseFrame() {
+    if (beatScript.data) { beatScriptTick(); beatUpdateMeters(); return; }
+    if (!beatEngine.analyser || !beatEngine.isPlaying) return;
+
+    const bufLen    = beatEngine.analyser.frequencyBinCount; // 1024
+    const data      = new Uint8Array(bufLen);
+    beatEngine.analyser.getByteFrequencyData(data);
+
+    const sampleRate = beatEngine.audioCtx.sampleRate;
+    const binHz      = sampleRate / beatEngine.analyser.fftSize;
+    const hi         = beatEngine.histIdx % BEAT_HISTORY_SIZE;
+    const now        = performance.now();
+
+    for (const [instr, band] of Object.entries(BEAT_BANDS)) {
+        const minBin = Math.max(0, Math.floor(band.minHz / binHz));
+        const maxBin = Math.min(bufLen - 1, Math.ceil(band.maxHz / binHz));
+
+        let energy = 0;
+        for (let b = minBin; b <= maxBin; b++) energy += data[b];
+
+        beatEngine.energyHist[instr][hi] = energy;
+        beatEngine.currentEnergy[instr]  = energy;
+
+        // Sliding window average
+        let avg = 0;
+        for (let i = 0; i < BEAT_HISTORY_SIZE; i++) avg += beatEngine.energyHist[instr][i];
+        avg /= BEAT_HISTORY_SIZE;
+
+        // Onset detection with per-band cooldown
+        if (
+            energy > avg * band.threshold &&
+            energy > BEAT_MIN_ENERGY &&
+            now - beatEngine.lastHit[instr] > BEAT_COOLDOWN_MS
+        ) {
+            beatEngine.lastHit[instr] = now;
+            onBeatHit(instr);
+        }
+    }
+
+    beatEngine.histIdx++;
+    beatUpdateMeters();
+}
+
+/* --- 6. Trigger logic --- */
+
+function onBeatHit(instrument) {
+    if (!state.ready) return;
+    const mapping = beatMap[instrument];
+    if (!mapping.enabled) return;
+    applyBeatPreset(instrument);
+}
+
+function applyBeatPreset(instr) {
+    if (!state.ready) return;
+    // Use style override if set, otherwise fall back to beatMap preset
+    const styleBundle = BEAT_STYLES[beatScript.macro.style];
+    const p = (styleBundle && styleBundle[instr]) ? styleBundle[instr] : beatMap[instr].preset;
+
+    // Switch anim mode in-place — do NOT call setMode() (it stops playback)
+    anim.mode = p.mode;
+    el.selectMode.value = p.mode;
+    canvas.style.cursor = p.mode === 'standard' ? 'ew-resize' : 'default';
+
+    // Loop mode + stutter scaled by macro intensity
+    anim.loopMode = p.loopMode;
+    if (el.selectLoop) el.selectLoop.value = p.loopMode;
+    const scaledStutter = Math.max(1, Math.min(6, Math.round(p.stutter * beatScript.macro.intensity)));
+    anim.stutter = scaledStutter;
+    if (el.inputStutter) el.inputStutter.value = scaledStutter;
+    if (el.stutterValue) el.stutterValue.innerText = scaledStutter;
+
+    // Grid swap via precomputed layout (if available)
+    const layout = beatEngine.presetLayouts[instr];
+    if (layout) {
+        state.tiles = layout.map(t => ({ ...t, frameIndex: 0, frameOffset: 0, isPinned: false }));
+        el.inputCols.value = p.cols;
+        el.inputRows.value = p.rows;
+    }
+
+    // Re-seed tileOffsets/tilePhases for the (possibly new) tile count
+    const n = state.tiles.length;
+    const N = state.totalFrames;
+    const rng = _seededRng(Date.now() | 0);
+    anim.tileOffsets = Array.from({ length: n }, () => rng());
+    anim.tilePhases  = anim.tileOffsets.map(r => r * N);
+
+    // Spatial shuffle
+    el.checkSpatialShuffle.checked = p.shuffleEnabled;
+    el.inputSpatialAmt.value = p.shuffleAmt;
+    if (el.spatialAmtValue) el.spatialAmtValue.innerText = p.shuffleAmt;
+    if (p.shuffleEnabled) applySpatialShuffle(p.shuffleAmt);
+    else resetSpatialShuffle();
+
+    // Flash all tiles for visual beat feedback
+    for (const tile of state.tiles) beatFlashTile(tile, instr);
+
+    updateStatus();
+}
+
+function beatComputePresets(silent = false) {
+    if (!state.ready) { if (!silent) showToast('Load a video first'); return; }
+
+    beatEngine.presetLayouts = {};
+    const vW = state.video.width;
+    const vH = state.video.height;
+    const vRatio = vW / vH;
+    const s  = Math.min(1, MAX_CANVAS_DIM / vW, MAX_CANVAS_DIM / vH);
+    const cW = Math.round(vW * s);
+    const cH = Math.round(vH * s);
+    const cRatio = cW / cH;
+    let crW = vW, crH = vH;
+    if (cRatio > vRatio) crH = vW / cRatio;
+    else crW = vH * cRatio;
+
+    for (const [instr, mapping] of Object.entries(beatMap)) {
+        const p    = mapping.preset;
+        const cols = Math.max(1, Math.min(30, p.cols));
+        const rows = Math.max(1, Math.min(30, p.rows));
+        const sW   = crW / cols;
+        const sH   = crH / rows;
+        const oX   = (vW - crW) / 2;
+        const oY   = (vH - crH) / 2;
+        const tiles = [];
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                tiles.push({
+                    x: c * (cW / cols), y: r * (cH / rows),
+                    w: cW / cols,       h: cH / rows,
+                    srcX: oX + c * sW,  srcY: oY + r * sH,
+                    origSrcX: oX + c * sW, origSrcY: oY + r * sH,
+                    srcW: sW, srcH: sH,
+                    frameIndex: 0, frameOffset: 0,
+                    isPinned: false, id: r * cols + c
+                });
+            }
+        }
+        beatEngine.presetLayouts[instr] = tiles;
+    }
+
+    const bw = $('beatWarning');
+    if (bw) bw.style.display = 'none';
+    if (!silent) showToast('Presets computed — beat engine ready', 'info');
+}
+
+/* --- Beat Script: offline analysis, scripted playback, macro UI --- */
+
+function beatAnalyseOffline() {
+    if (!beatEngine.audioBuffer) { showToast('Load audio first'); return null; }
+
+    const buf  = beatEngine.audioBuffer;
+    const fs   = buf.sampleRate;
+    const data = buf.getChannelData(0);
+    const N    = data.length;
+    const dur  = N / fs;
+    const HOP  = 1024;
+    const SCALE = 3000;
+
+    // IIR bandpass filter coefficients per band
+    const bands = [
+        { id: 'kick',  fcHP: 40,   fcLP: 180,   ...BEAT_BANDS.kick  },
+        { id: 'snare', fcHP: 180,  fcLP: 900,   ...BEAT_BANDS.snare },
+        { id: 'lead',  fcHP: 900,  fcLP: 4000,  ...BEAT_BANDS.lead  },
+        { id: 'hihat', fcHP: 4000, fcLP: 14000, ...BEAT_BANDS.hihat },
+    ];
+    const filt = {};
+    for (const b of bands) {
+        filt[b.id] = { hp_a: Math.exp(-2*Math.PI*b.fcHP/fs), lp_a: Math.exp(-2*Math.PI*b.fcLP/fs), hp_y:0, hp_xp:0, lp_y:0 };
+    }
+
+    const hist = {}; const instrs = bands.map(b => b.id);
+    for (const id of instrs) hist[id] = new Float32Array(BEAT_HISTORY_SIZE);
+    const lastHit = { kick:-Infinity, snare:-Infinity, lead:-Infinity, hihat:-Infinity };
+    const COOLDOWN = BEAT_COOLDOWN_MS / 1000;
+    const frameEnergy = { kick:0, snare:0, lead:0, hihat:0 };
+    let histIdx = 0, broadRMS = 0, sampleCount = 0;
+
+    const beats = [];
+    const ENV_STEP = 0.1;
+    const envVals = []; let envAccum = 0, envCount = 0;
+
+    for (let i = 0; i < N; i++) {
+        const x = data[i];
+        for (const b of bands) {
+            const f = filt[b.id];
+            f.hp_y = f.hp_a * (f.hp_y + x - f.hp_xp); f.hp_xp = x;
+            f.lp_y = f.lp_a * f.lp_y + (1 - f.lp_a) * f.hp_y;
+            frameEnergy[b.id] += f.lp_y * f.lp_y;
+        }
+        broadRMS += x * x; sampleCount++;
+
+        if (sampleCount === HOP) {
+            const t = (i - HOP + 1) / fs;
+            const hi = histIdx % BEAT_HISTORY_SIZE;
+            for (const b of bands) {
+                const e = Math.sqrt(frameEnergy[b.id] / HOP) * SCALE;
+                hist[b.id][hi] = e;
+                let avg = 0; for (let j=0; j<BEAT_HISTORY_SIZE; j++) avg += hist[b.id][j]; avg /= BEAT_HISTORY_SIZE;
+                if (e > avg * b.threshold && e > BEAT_MIN_ENERGY && t - lastHit[b.id] > COOLDOWN) {
+                    lastHit[b.id] = t;
+                    beats.push({ t: Math.round(t * 1000)/1000, b: b.id, e: Math.min(1, e/300) });
+                }
+                frameEnergy[b.id] = 0;
+            }
+            envAccum += Math.sqrt(broadRMS / HOP); envCount++;
+            if (t >= envVals.length * ENV_STEP) { envVals.push(envAccum / envCount); envAccum = 0; envCount = 0; }
+            histIdx++; broadRMS = 0; sampleCount = 0;
+        }
+    }
+
+    // BPM from kick interval median
+    const kickTs = beats.filter(b => b.b === 'kick').map(b => b.t);
+    let bpm = 0;
+    if (kickTs.length > 4) {
+        const ivs = []; for (let i=1; i<kickTs.length; i++) ivs.push(kickTs[i] - kickTs[i-1]);
+        ivs.sort((a,b) => a-b);
+        const med = ivs[Math.floor(ivs.length/2)]; bpm = Math.round(60/med);
+        if (bpm < 60 || bpm > 300) bpm = 0;
+    }
+
+    // Sections: 8-bar blocks
+    const barLen   = bpm > 0 ? (4 * 60 / bpm) : 4;
+    const secLen   = barLen * 8;
+    const envNorm  = Math.max(...envVals, 0.001);
+    const sections = [];
+    for (let t=0; t<dur; t+=secLen) {
+        const end = Math.min(t+secLen, dur);
+        const si = Math.floor(t/ENV_STEP), ei = Math.min(Math.floor(end/ENV_STEP), envVals.length);
+        let sum=0, cnt=0; for (let j=si; j<ei; j++) { sum+=envVals[j]; cnt++; }
+        sections.push({ t: Math.round(t*10)/10, end: Math.round(end*10)/10, intensity: cnt > 0 ? Math.min(1, (sum/cnt)/envNorm) : 0 });
+    }
+
+    return { v:2, title: beatEngine.audioFile?.name ?? 'audio', duration: Math.round(dur*10)/10, bpm, beats, envelope: envVals.map(v=>Math.round(v*10000)/10000), envStep: ENV_STEP, sections };
+}
+
+function beatScriptTick() {
+    if (!beatScript.data || !beatEngine.isPlaying) return;
+    const sd  = beatScript.data;
+    const pos = beatEngine.audioCtx.currentTime - beatEngine.startTime + beatEngine.startOffset;
+    const m   = beatScript.macro;
+
+    // Drive beatEnv from pre-recorded envelope (feeds beatApplyContinuous)
+    const envIdx = Math.min(Math.floor(pos / sd.envStep), sd.envelope.length - 1);
+    if (envIdx >= 0) {
+        const envNorm = Math.min(1, sd.envelope[envIdx] / 0.03);
+        for (const k of Object.keys(BEAT_BANDS)) {
+            if (beatMap[k].enabled) beatEnv[k] = envNorm * 0.7;
+            beatEngine.currentEnergy[k] = envNorm * BEAT_METER_MAX[k] * 0.6;
+        }
+    }
+
+    // Fire beat events from timeline
+    let stepIdx = 0;
+    while (beatScript.beatIdx < sd.beats.length) {
+        const beat = sd.beats[beatScript.beatIdx];
+        if (beat.t > pos) break;
+        beatScript.beatIdx++;
+        // tempoMult: fire 1 every N beats
+        stepIdx++;
+        if (m.tempoMult > 1 && stepIdx % m.tempoMult !== 0) continue;
+        if (beatMap[beat.b] && beatMap[beat.b].enabled) {
+            onBeatHit(beat.b);
+            beatEngine.currentEnergy[beat.b] = BEAT_METER_MAX[beat.b] * Math.min(1, beat.e * 1.5);
+        }
+    }
+
+    // Section-based preset changes
+    while (beatScript.sectionIdx < sd.sections.length) {
+        const sec = sd.sections[beatScript.sectionIdx];
+        if (sec.t > pos) break;
+        beatScript.sectionIdx++;
+        if (sec.intensity >= m.threshold) {
+            // Apply the instrument whose preset best matches this section intensity
+            const instr = sec.intensity > 0.7 ? 'hihat' : sec.intensity > 0.5 ? 'snare' : sec.intensity > 0.3 ? 'lead' : 'kick';
+            if (beatMap[instr].enabled) onBeatHit(instr);
+        }
+    }
+}
+
+function beatApplyStyle(style) {
+    const bundle = BEAT_STYLES[style];
+    if (!bundle) return; // 'balanced' = keep existing beatMap presets
+    for (const instr of Object.keys(BEAT_BANDS)) {
+        if (bundle[instr]) beatMap[instr].preset = { ...bundle[instr] };
+    }
+    beatComputePresets(true);
+    beatRenderMappingUI();
+}
+
+function beatExportScript() {
+    if (!beatScript.data) { showToast('Analyze audio first'); return; }
+    const blob = new Blob([JSON.stringify(beatScript.data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (beatScript.data.title || 'beat').replace(/\.[^.]+$/, '') + '.beat.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+function beatImportScript(json) {
+    if (!json.v || json.v !== 2 || !Array.isArray(json.beats) || !Array.isArray(json.sections)) {
+        showToast('Invalid beat script file'); return;
+    }
+    beatScript.data       = json;
+    beatScript.beatIdx    = 0;
+    beatScript.sectionIdx = 0;
+    const nameEl = $('beatScriptName');
+    if (nameEl) nameEl.textContent = json.title || 'script';
+    const exportBtn = $('btnBeatExportScript');
+    if (exportBtn) exportBtn.disabled = false;
+    showToast(`Script loaded: ${json.beats.length} beats, BPM ${json.bpm || '?'}`, 'info');
+    // Precompute preset layouts now that we have data
+    beatComputePresets(true);
+}
+
+function beatRenderMacroUI() {
+    const container = $('beatMacroUI');
+    if (!container) return;
+    container.innerHTML = '';
+    const m = beatScript.macro;
+
+    function makeSlider(label, id, min, max, step, value, fmt, onChange) {
+        const row = document.createElement('div'); row.className = 'slider-row';
+        const head = document.createElement('div'); head.className = 'slider-head';
+        const lbl = document.createElement('span'); lbl.className = 'field-label'; lbl.textContent = label;
+        const valEl = document.createElement('span'); valEl.className = 'slider-value'; valEl.id = id+'Val'; valEl.textContent = fmt(value);
+        head.append(lbl, valEl);
+        const sl = document.createElement('input'); sl.type = 'range'; sl.className = 'slider';
+        sl.min = min; sl.max = max; sl.step = step; sl.value = value; sl.id = id;
+        sl.addEventListener('input', () => { valEl.textContent = fmt(parseFloat(sl.value)); onChange(parseFloat(sl.value)); });
+        row.append(head, sl); return row;
+    }
+
+    function makeSelect(label, options, value, onChange) {
+        const wrap = document.createElement('div'); wrap.className = 'field';
+        const lbl = document.createElement('div'); lbl.className = 'field-label'; lbl.textContent = label;
+        const sel = document.createElement('select'); sel.className = 'field-select';
+        for (const [v, t] of options) { const o = document.createElement('option'); o.value=v; o.textContent=t; if(v===value) o.selected=true; sel.appendChild(o); }
+        sel.addEventListener('change', () => onChange(sel.value));
+        wrap.append(lbl, sel); return wrap;
+    }
+
+    container.appendChild(makeSlider('Intensity', 'macroIntensity', 0.1, 2.0, 0.1, m.intensity, v => v.toFixed(1)+'×', v => { beatScript.macro.intensity = v; }));
+    container.appendChild(makeSelect('Tempo', [['1','1× (all beats)'],['2','2× (half)'],['4','4× (quarter)']], String(m.tempoMult), v => { beatScript.macro.tempoMult = parseInt(v); }));
+    container.appendChild(makeSelect('Style', [['minimal','Minimal'],['balanced','Balanced'],['chaos','Chaos'],['cinematic','Cinematic']], m.style, v => { beatScript.macro.style = v; beatApplyStyle(v); }));
+    container.appendChild(makeSlider('Threshold', 'macroThreshold', 0, 1, 0.05, m.threshold, v => v.toFixed(2), v => { beatScript.macro.threshold = v; }));
+}
+
+/* --- 7. Visual flash --- */
+
+function beatFlashTile(tile, instrument) {
+    beatFlashes.set(tile.id, { instrument, expiresAt: performance.now() + BEAT_FLASH_MS });
+    if (!anim.playing) renderAll();
+    setTimeout(() => {
+        beatFlashes.delete(tile.id);
+        if (!anim.playing) renderAll();
+    }, BEAT_FLASH_MS);
+}
+
+/* --- UI: energy meters --- */
+
+function beatUpdateMeters() {
+    const ids = { kick: 'meterKick', snare: 'meterSnare', lead: 'meterLead', hihat: 'meterHihat' };
+    for (const [instr, id] of Object.entries(ids)) {
+        const el = $(id);
+        if (!el) continue;
+        const pct = Math.min(100, (beatEngine.currentEnergy[instr] / BEAT_METER_MAX[instr]) * 100);
+        el.style.width = pct + '%';
+    }
+}
+
+/* --- 4+5. UI panel: mapping --- */
+
+function beatRenderMappingUI() {
+    const container = $('beatMappingUI');
+    if (!container) return;
+    container.innerHTML = '';
+
+    for (const instr of ['kick', 'snare', 'lead', 'hihat']) {
+        const mapping = beatMap[instr];
+        const block   = document.createElement('div');
+        block.className = 'beat-instr-block';
+
+        // Header: colored name + enabled toggle
+        const header = document.createElement('div');
+        header.className = 'beat-instr-header';
+        const nameEl = document.createElement('span');
+        nameEl.className   = `beat-instr-name ${instr}`;
+        nameEl.textContent = instr.toUpperCase();
+        const togLabel = document.createElement('label');
+        togLabel.className = 'toggle';
+        const togSpan  = document.createElement('span');
+        togSpan.textContent = 'enabled';
+        const togCb = document.createElement('input');
+        togCb.type    = 'checkbox';
+        togCb.checked = mapping.enabled;
+        togCb.addEventListener('change', () => { beatMap[instr].enabled = togCb.checked; });
+        const togTrack = document.createElement('span');
+        togTrack.className = 'toggle-track';
+        togLabel.append(togSpan, togCb, togTrack);
+        header.append(nameEl, togLabel);
+        block.appendChild(header);
+
+        // Preset editor
+        block.appendChild(beatMakePresetEditor(instr, mapping.preset));
+        container.appendChild(block);
+    }
+}
+
+function beatMakePresetEditor(instr, p) {
+    const wrap = document.createElement('div');
+    wrap.className = 'beat-preset-fields';
+
+    // Row 1: Mode + Loop
+    const row1 = document.createElement('div');
+    row1.className = 'beat-preset-row';
+
+    const modeField = document.createElement('div');
+    modeField.className = 'beat-preset-field';
+    const modeLbl = document.createElement('span');
+    modeLbl.className = 'beat-target-label';
+    modeLbl.textContent = 'Mode';
+    const modeSel = document.createElement('select');
+    modeSel.className = 'field-select beat-preset-select';
+    [['standard','Standard'],['linear-lr','→'],['linear-rl','←'],['temporal-shuffle','Shuffle'],['drunk','Drunk'],['perlin-flow','Perlin']].forEach(([v, t]) => {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = t; if (v === p.mode) o.selected = true;
+        modeSel.appendChild(o);
+    });
+    modeSel.addEventListener('change', () => { beatMap[instr].preset.mode = modeSel.value; });
+    modeField.append(modeLbl, modeSel);
+
+    const loopField = document.createElement('div');
+    loopField.className = 'beat-preset-field';
+    const loopLbl = document.createElement('span');
+    loopLbl.className = 'beat-target-label';
+    loopLbl.textContent = 'Loop';
+    const loopSel = document.createElement('select');
+    loopSel.className = 'field-select beat-preset-select';
+    [['wrap','Wrap'],['pingpong','Ping'],['hold','Hold']].forEach(([v, t]) => {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = t; if (v === p.loopMode) o.selected = true;
+        loopSel.appendChild(o);
+    });
+    loopSel.addEventListener('change', () => { beatMap[instr].preset.loopMode = loopSel.value; });
+    loopField.append(loopLbl, loopSel);
+    row1.append(modeField, loopField);
+
+    // Stutter slider
+    const stutterWrap = document.createElement('div');
+    stutterWrap.className = 'beat-preset-slider';
+    const stutterHead = document.createElement('div');
+    stutterHead.className = 'slider-head';
+    const stutterLbl = document.createElement('span');
+    stutterLbl.className = 'field-label';
+    stutterLbl.textContent = 'Stutter';
+    const stutterVal = document.createElement('span');
+    stutterVal.className = 'slider-value';
+    stutterVal.textContent = p.stutter + 'x';
+    stutterHead.append(stutterLbl, stutterVal);
+    const stutterSlider = document.createElement('input');
+    stutterSlider.type = 'range'; stutterSlider.className = 'slider';
+    stutterSlider.min = 1; stutterSlider.max = 6; stutterSlider.step = 1; stutterSlider.value = p.stutter;
+    stutterSlider.addEventListener('input', () => {
+        beatMap[instr].preset.stutter = parseInt(stutterSlider.value);
+        stutterVal.textContent = stutterSlider.value + 'x';
+    });
+    stutterWrap.append(stutterHead, stutterSlider);
+
+    // Row 2: Cols + Rows
+    const row2 = document.createElement('div');
+    row2.className = 'beat-preset-row';
+
+    const colsField = document.createElement('div');
+    colsField.className = 'beat-preset-field';
+    const colsLbl = document.createElement('span');
+    colsLbl.className = 'beat-target-label';
+    colsLbl.textContent = 'Cols';
+    const colsIn = document.createElement('input');
+    colsIn.type = 'number'; colsIn.className = 'field-input beat-preset-num';
+    colsIn.min = 1; colsIn.max = 30; colsIn.value = p.cols;
+    colsIn.addEventListener('change', () => { beatMap[instr].preset.cols = Math.max(1, Math.min(30, parseInt(colsIn.value) || 1)); });
+    colsField.append(colsLbl, colsIn);
+
+    const rowsField = document.createElement('div');
+    rowsField.className = 'beat-preset-field';
+    const rowsLbl = document.createElement('span');
+    rowsLbl.className = 'beat-target-label';
+    rowsLbl.textContent = 'Rows';
+    const rowsIn = document.createElement('input');
+    rowsIn.type = 'number'; rowsIn.className = 'field-input beat-preset-num';
+    rowsIn.min = 1; rowsIn.max = 30; rowsIn.value = p.rows;
+    rowsIn.addEventListener('change', () => { beatMap[instr].preset.rows = Math.max(1, Math.min(30, parseInt(rowsIn.value) || 1)); });
+    rowsField.append(rowsLbl, rowsIn);
+    row2.append(colsField, rowsField);
+
+    // Shuffle toggle + amount
+    const shuffleWrap = document.createElement('div');
+    shuffleWrap.className = 'beat-preset-shuffle';
+    const shuffleTogLabel = document.createElement('label');
+    shuffleTogLabel.className = 'toggle';
+    shuffleTogLabel.style.fontSize = '10px';
+    const shuffleTxt = document.createElement('span');
+    shuffleTxt.textContent = 'Shuffle';
+    const shuffleCb = document.createElement('input');
+    shuffleCb.type = 'checkbox'; shuffleCb.checked = p.shuffleEnabled;
+    const shuffleTrack = document.createElement('span');
+    shuffleTrack.className = 'toggle-track';
+    shuffleTogLabel.append(shuffleTxt, shuffleCb, shuffleTrack);
+
+    const amtWrap = document.createElement('div');
+    amtWrap.className = 'beat-preset-amt';
+    amtWrap.style.display = p.shuffleEnabled ? 'flex' : 'none';
+    const amtLbl = document.createElement('span');
+    amtLbl.className = 'beat-target-label';
+    amtLbl.textContent = 'Amt';
+    const amtIn = document.createElement('input');
+    amtIn.type = 'number'; amtIn.className = 'field-input beat-preset-num';
+    amtIn.min = 0; amtIn.max = 10; amtIn.value = p.shuffleAmt;
+    amtIn.addEventListener('change', () => { beatMap[instr].preset.shuffleAmt = Math.max(0, Math.min(10, parseInt(amtIn.value) || 0)); });
+    amtWrap.append(amtLbl, amtIn);
+
+    shuffleCb.addEventListener('change', () => {
+        beatMap[instr].preset.shuffleEnabled = shuffleCb.checked;
+        amtWrap.style.display = shuffleCb.checked ? 'flex' : 'none';
+    });
+    shuffleWrap.append(shuffleTogLabel, amtWrap);
+
+    wrap.append(row1, stutterWrap, row2, shuffleWrap);
+    return wrap;
+}
+
+/* --- Event bindings --- */
+
+const _beatFileInput = $('beatFileInput');
+const _btnBeatLoad   = $('btnBeatLoad');
+const _btnBeatStop   = $('btnBeatStop');
+const _btnBeatSave   = $('btnBeatSave');
+const _btnBeatReset  = $('btnBeatReset');
+
+if (_beatFileInput) {
+    _beatFileInput.addEventListener('change', (e) => {
+        const f = e.target.files?.[0];
+        if (f) beatLoadFile(f);
+        e.target.value = '';
+    });
+}
+
+if (_btnBeatLoad) {
+    _btnBeatLoad.addEventListener('click', () => _beatFileInput && _beatFileInput.click());
+}
+
+if (_btnBeatStop) {
+    _btnBeatStop.addEventListener('click', () => {
+        beatAudioStop();
+    });
+}
+
+if (_btnBeatSave) {
+    _btnBeatSave.addEventListener('click', () => {
+        beatSaveMap();
+        showToast('Beat mapping saved', 'info');
+    });
+}
+
+if (_btnBeatReset) {
+    _btnBeatReset.addEventListener('click', () => {
+        beatMap = beatDefaultPresets();
+        beatEngine.presetLayouts = {};
+        beatSaveMap();
+        beatRenderMappingUI();
+    });
+}
+
+const _btnBeatCompute = $('btnBeatCompute');
+if (_btnBeatCompute) {
+    _btnBeatCompute.addEventListener('click', beatComputePresets);
+}
+
+// Beat Script buttons
+const _btnBeatAnalyze      = $('btnBeatAnalyze');
+const _btnBeatExportScript = $('btnBeatExportScript');
+const _btnBeatImportScript = $('btnBeatImportScript');
+const _beatScriptInput     = $('beatScriptInput');
+
+if (_btnBeatAnalyze) {
+    _btnBeatAnalyze.addEventListener('click', () => {
+        const result = beatAnalyseOffline();
+        if (!result) return;
+        beatScript.data       = result;
+        beatScript.beatIdx    = 0;
+        beatScript.sectionIdx = 0;
+        const nameEl = $('beatScriptName');
+        if (nameEl) nameEl.textContent = result.title;
+        if (_btnBeatExportScript) _btnBeatExportScript.disabled = false;
+        beatComputePresets(true);
+        showToast(`Analyzed: ${result.beats.length} beats, BPM ${result.bpm || '?'}`, 'info');
+    });
+}
+
+if (_btnBeatExportScript) {
+    _btnBeatExportScript.addEventListener('click', beatExportScript);
+}
+
+if (_btnBeatImportScript) {
+    _btnBeatImportScript.addEventListener('click', () => _beatScriptInput && _beatScriptInput.click());
+}
+
+if (_beatScriptInput) {
+    _beatScriptInput.addEventListener('change', (e) => {
+        const f = e.target.files?.[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            try { beatImportScript(JSON.parse(ev.target.result)); } catch(_) { showToast('Cannot parse JSON'); }
+        };
+        reader.readAsText(f);
+        e.target.value = '';
+    });
+}
+
+/* --- 9. Init --- */
+beatRenderMappingUI();
+beatRenderMacroUI();
 
