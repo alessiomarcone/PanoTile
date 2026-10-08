@@ -128,6 +128,10 @@ const el = {
     stutterValue: $('stutterValue'),
     selectCache: $('selectCache'),
     cacheInfo: $('cacheInfo'),
+    exportQualityWarn: $('exportQualityWarn'),
+    inputFreezeSpan: $('inputFreezeSpan'),
+    freezeSpanValue: $('freezeSpanValue'),
+    btnUnfreeze: $('btnUnfreeze'),
     btnProjectSave: $('btnProjectSave'),
     btnProjectOpen: $('btnProjectOpen'),
     projectUpload: $('projectUpload'),
@@ -413,7 +417,8 @@ function computeCacheSize(count) {
     let scale = 1;
 
     if (pref === 'auto') {
-        scale = Math.min(1, Math.sqrt(budget / (count * vW * vH * 4)));
+        // No bigger than the export needs, no bigger than the memory budget allows
+        scale = Math.min(1, neededCacheScale(), Math.sqrt(budget / (count * vW * vH * 4)));
         scale = Math.max(scale, Math.min(1, MIN_CACHE_LONG_SIDE / longSide));
     } else if (pref !== 'full') {
         scale = Math.min(1, parseInt(pref, 10) / longSide);
@@ -425,6 +430,39 @@ function computeCacheSize(count) {
     const h = Math.max(2, round(vH * scale));
     const bytes = count * w * h * 4;
     return { w, h, bytes, budget, overBudget: bytes > budget };
+}
+
+/** Source pixels shown across the canvas width (the grid crops the video to the canvas aspect). */
+function sourceCropWidth(aspect) {
+    const vW = state.video.width, vH = state.video.height;
+    return aspect > vW / vH ? vW : vH * aspect;
+}
+
+function canvasAspect() {
+    return state.tiles.length ? canvas.width / canvas.height : state.video.width / state.video.height;
+}
+
+/** Cache scale at which the selected export resolution shows cached pixels 1:1. */
+function neededCacheScale() {
+    const aspect = canvasAspect();
+    const { w } = exportSize(el.selectRes.value, { aspect });
+    return Math.min(1, w / sourceCropWidth(aspect));
+}
+
+/** Warn when the export has to enlarge the cached frames (soft / blocky output). */
+function updateExportQualityWarning() {
+    const warn = el.exportQualityWarn;
+    if (!warn) return;
+    if (!state.ready) { warn.hidden = true; return; }
+    const aspect = canvasAspect();
+    const { w } = exportSize(el.selectRes.value, { aspect });
+    const cropW = sourceCropWidth(aspect);
+    const up = w / (cropW * state.frameScaleX);
+    if (up <= 1.15) { warn.hidden = true; return; }
+    warn.hidden = false;
+    warn.textContent = state.frameScaleX >= 0.999
+        ? `ℹ The source is only ${Math.round(cropW)} px wide here — this export enlarges it ×${up.toFixed(1)}.`
+        : `⚠ Frames are cached at ${Math.round(cropW * state.frameScaleX)} px — this export enlarges them ×${up.toFixed(1)} and will look soft. Raise Frame quality (Range), shorten the range or lower FPS.`;
 }
 
 /** Live estimate shown under the range selector. */
@@ -566,6 +604,8 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
         remapProjectFrames(prevRange || { ...state.range }, prevN);
     }
     updateStatus();
+    updateCacheInfo();
+    updateExportQualityWarning();
     onFramesReady({ fresh });
     return true;
 }
@@ -1116,6 +1156,7 @@ function initProject() {
         }
     }
     rememberGrid();
+    updateExportQualityWarning();
     setMode(anim.mode);
     if (el.checkSpatialShuffle.checked && state.ready) {
         applySpatialShuffle(parseInt(el.inputSpatialAmt.value));
@@ -1245,10 +1286,11 @@ function renderAll() {
         }
     }
 
-    // Pin overlays — SKIPPED during export (bug fix: pins used to appear in PNG)
+    // Pin overlays — SKIPPED during export (bug fix: pins used to appear in PNG).
+    // They follow "Show grid", so a fully frozen grid can be previewed clean.
     if (!state.isExporting) {
         for (const t of state.tiles) {
-            if (t.isPinned) {
+            if (t.isPinned && el.checkGrid.checked) {
                 ctx.strokeStyle = 'rgba(255, 184, 0, 0.9)';
                 ctx.lineWidth = 2;
                 ctx.strokeRect(t.x + 1.5, t.y + 1.5, t.w - 3, t.h - 3);
@@ -1362,16 +1404,16 @@ canvas.style.touchAction = 'none';
 canvas.addEventListener('pointerdown', (e) => {
     // Left mouse button, primary touch, or pen — ignore middle/right
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    // Allow scrub in Standard mode even while playing (live time-scrubbing)
-    if (anim.mode !== 'standard') return;
     const t = tileAtEvent(e);
-    if (t && !t.isPinned) {
+    // Frozen (pinned) tiles can be re-timed in any mode: drag moves their frozen frame.
+    // Live tiles scrub only in Standard mode (even while playing).
+    if (t && (t.isPinned || anim.mode === 'standard')) {
         state.activeTile = t;
         state.hoverTile = t;
         state.isDragging = true;
         state.scrubbingTile = t;
         state.dragStartX = e.clientX;
-        state.dragStartFrame = t.frameOffset;
+        state.dragStartFrame = t.isPinned ? t.frameIndex : t.frameOffset;
         document.body.style.cursor = 'ew-resize';
         // Capture so we keep receiving events if the pointer leaves the canvas
         try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* no-op */ }
@@ -1389,7 +1431,14 @@ canvas.addEventListener('pointermove', (e) => {
         const N = state.totalFrames;
         let newOffset = state.dragStartFrame + Math.floor(px / sensitivity);
         newOffset = Math.max(-(N - 1), Math.min(N - 1, newOffset));
-        if (state.activeTile) {
+        if (state.activeTile && state.activeTile.isPinned) {
+            const idx = Math.max(0, Math.min(N - 1, newOffset));
+            if (state.activeTile.frameIndex !== idx) {
+                state.activeTile.frameIndex = idx;
+                renderAll();
+                updateTimeline();
+            }
+        } else if (state.activeTile) {
             state.activeTile.frameOffset = newOffset;
             const rangeDur = Math.max(0.1, state.range.out - state.range.in);
             const rate = N / rangeDur;
@@ -1702,6 +1751,44 @@ function applyBlockPattern(pattern, amount) {
     updateTimeline();
 }
 
+/**
+ * Time freeze: pin every tile on its own moment, stepping through the range in
+ * the given spatial order — a moving subject is frozen across the grid like a
+ * chronophotograph. span (0–1) is the fraction of the range covered.
+ */
+function applyTimeFreeze(order, span) {
+    const cols = parseInt(el.inputCols.value, 10);
+    const rows = Math.ceil(state.tiles.length / cols);
+    const n = state.tiles.length;
+    const N = state.totalFrames;
+    if (n === 0 || N === 0) return;
+
+    let ranks;
+    if (order === 'shuffle') {
+        ranks = Array.from({ length: n }, (_, i) => i);
+        for (let i = n - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [ranks[i], ranks[j]] = [ranks[j], ranks[i]];
+        }
+    } else {
+        ranks = state.tiles.map((_, i) => {
+            const c = i % cols, r = Math.floor(i / cols);
+            if (order === 'rl') return n - 1 - i;
+            if (order === 'tb') return c * rows + r;
+            return i;   // 'lr'
+        });
+    }
+
+    const step = span * (N - 1) / Math.max(1, n - 1);
+    state.tiles.forEach((t, i) => {
+        t.isPinned = true;
+        t.frameIndex = Math.max(0, Math.min(N - 1, Math.round(ranks[i] * step)));
+    });
+    renderAll();
+    updateStatus();
+    updateTimeline();
+}
+
 function clearAllPins() {
     state.tiles.forEach(t => {
         t.isPinned = false;
@@ -1767,6 +1854,9 @@ function enableControls() {
     el.checkLoop.disabled = false;
     el.btnPlayPause.disabled = false;
     el.btnProjectSave.disabled = false;
+    el.inputFreezeSpan.disabled = false;
+    el.btnUnfreeze.disabled = false;
+    document.querySelectorAll('.freeze-btn').forEach(b => { b.disabled = false; });
     if (el.selectLoop) el.selectLoop.disabled = false;
     if (el.inputStutter) el.inputStutter.disabled = false;
 }
@@ -1790,12 +1880,31 @@ function getExportPath() {
 }
 
 /**
+ * Export canvas size for a resolution tier, keeping the preview canvas aspect
+ * (hardcoded 16:9 dims would stretch portrait or square content).
+ * aspect defaults to the current canvas; even = H.264-safe dimensions.
+ */
+function exportSize(res, { even = true, aspect = canvas.width / canvas.height } = {}) {
+    let w, h;
+    if (res === 'preview') {
+        w = Math.round(aspect >= 1 ? MAX_CANVAS_DIM : MAX_CANVAS_DIM * aspect);
+        h = Math.round(aspect >= 1 ? MAX_CANVAS_DIM / aspect : MAX_CANVAS_DIM);
+        if (state.tiles.length) { w = canvas.width; h = canvas.height; }
+    } else {
+        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
+        if (aspect >= 1) { w = longSide; h = Math.round(longSide / aspect); }
+        else             { h = longSide; w = Math.round(longSide * aspect); }
+    }
+    return even ? ensureEvenDimensions(w, h) : { w, h };
+}
+
+/**
  * Ensure canvas dimensions are even (required for H.264 compliance).
  */
 function ensureEvenDimensions(w, h) {
     return {
-        width: w + (w % 2),
-        height: h + (h % 2)
+        w: w + (w % 2),
+        h: h + (h % 2)
     };
 }
 
@@ -1880,25 +1989,9 @@ async function exportVideoWebCodecs(abort, fileHandle = null) {
     const totalFrames = Math.ceil(dur * fps);
 
     // Determine export canvas size
-    let expW, expH;
-    if (res === 'preview') {
-        expW = canvas.width;
-        expH = canvas.height;
-    } else {
-        // Scale the canvas aspect ratio to fit the chosen resolution tier.
-        // Hardcoded 16:9 dims would stretch portrait or square content.
-        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
-        const aspect = canvas.width / canvas.height;
-        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
-        else             { expH = longSide; expW = Math.round(longSide * aspect); }
-    }
-    const even = ensureEvenDimensions(expW, expH);
-    expW = even.width;
-    expH = even.height;
+    const { w: expW, h: expH } = exportSize(res);
 
-    // Bitrate by resolution
-    const bitrateMap = { 'preview': 6000000, '720': 6000000, '1080': 10000000, '4k': 20000000 };
-    let bitrate = bitrateMap[res] || 10000000;
+    const bitrate = exportBitrate(expW, expH, fps);
 
     // Create export canvas
     const expCanvas = document.createElement('canvas');
@@ -1924,17 +2017,6 @@ async function exportVideoWebCodecs(abort, fileHandle = null) {
         fastStart: writable ? false : 'in-memory'
     });
 
-    // Pick the minimum H.264 level that covers the actual pixel area.
-    // Using a level too low throws "coded area exceeds maximum" even after the
-    // aspect-ratio fix (e.g. 732×1280 = 937k px > L3.1 limit of 921k px).
-    const codecString = (() => {
-        const px = expW * expH;
-        if (px <= 921600)  return 'avc1.42001f'; // Baseline L3.1 ≤ 1280×720
-        if (px <= 2097152) return 'avc1.420028'; // Baseline L4.0 ≤ ~1920×1080
-        if (px <= 9437184) return 'avc1.420033'; // Baseline L5.1 ≤ 3840×2160
-        return 'avc1.420034';                     // Baseline L5.2 for anything larger
-    })();
-
     // Capture encoder errors via variable — throwing inside WebCodecs callbacks
     // does NOT propagate to the outer async try/catch; it only closes the encoder.
     let encoderError = null;
@@ -1944,20 +2026,13 @@ async function exportVideoWebCodecs(abort, fileHandle = null) {
         error: (err) => { encoderError = err; }
     });
 
-    const encoderConfig = {
-        codec: codecString,
-        width: expW,
-        height: expH,
-        bitrate: bitrate,
-        framerate: fps
-    };
-
     try {
         // Fail fast (before rendering anything) if the GPU/browser can't encode this size
-        const support = await VideoEncoder.isConfigSupported(encoderConfig).catch(() => null);
-        if (!support || !support.supported) {
-            throw new Error(`H.264 ${expW}×${expH} is not supported by this browser — try a lower resolution`);
+        const encoderConfig = await chooseEncoderConfig(expW, expH, fps, bitrate);
+        if (!encoderConfig) {
+            throw new Error(`H.264 ${expW}×${expH} @ ${fps}fps is not supported by this browser — try a lower resolution`);
         }
+        console.info(`Encoder: ${encoderConfig.codec}, ${(bitrate / 1e6).toFixed(1)} Mbps`);
         encoder.configure(encoderConfig);
 
         // Render each frame
@@ -2030,6 +2105,41 @@ async function exportVideoWebCodecs(abort, fileHandle = null) {
 }
 
 /**
+ * Bitrate from pixel rate (0.12 bits per pixel per frame), never below the old
+ * per-tier defaults and capped at 100 Mbps. 4K60 ≈ 55 Mbps, 1080p30 = 10 Mbps.
+ */
+function exportBitrate(w, h, fps) {
+    const floor = w * h > 2.1e6 ? 20e6 : w * h > 0.93e6 ? 10e6 : 6e6;
+    return Math.round(Math.min(100e6, Math.max(floor, w * h * fps * 0.12)));
+}
+
+// H.264 levels: max macroblocks per frame / per second (ITU-T H.264 Table A-1)
+const AVC_LEVELS = [
+    { hex: '1f', fs: 3600, mbps: 108000 },     // 3.1
+    { hex: '28', fs: 8192, mbps: 245760 },     // 4.0
+    { hex: '2a', fs: 8704, mbps: 522240 },     // 4.2
+    { hex: '33', fs: 36864, mbps: 983040 },    // 5.1
+    { hex: '34', fs: 36864, mbps: 2073600 },   // 5.2
+    { hex: '3c', fs: 139264, mbps: 4177920 },  // 6.0
+];
+
+/**
+ * Best supported H.264 config: High profile first (much better quality per bit
+ * than Baseline), then Main, then Baseline; level picked from frame size AND
+ * frame rate (4K60 needs 5.2, not 5.1). Returns null if nothing is supported.
+ */
+async function chooseEncoderConfig(w, h, fps, bitrate) {
+    const fs = Math.ceil(w / 16) * Math.ceil(h / 16);
+    const level = AVC_LEVELS.find(l => fs <= l.fs && fs * fps <= l.mbps) || AVC_LEVELS[AVC_LEVELS.length - 1];
+    for (const profile of ['6400', '4d00', '4200']) {   // High, Main, Baseline
+        const config = { codec: `avc1.${profile}${level.hex}`, width: w, height: h, bitrate, framerate: fps };
+        const support = await VideoEncoder.isConfigSupported(config).catch(() => null);
+        if (support && support.supported) return config;
+    }
+    return null;
+}
+
+/**
  * Render a single export frame at the given output frame index.
  * Uses the pipeline to compute tile frame indices.
  */
@@ -2076,21 +2186,7 @@ async function exportVideoMediaRecorder(abort) {
     const totalFrames = Math.ceil(dur * fps);
 
     // Determine export canvas size
-    let expW, expH;
-    if (res === 'preview') {
-        expW = canvas.width;
-        expH = canvas.height;
-    } else {
-        // Scale the canvas aspect ratio to fit the chosen resolution tier.
-        // Hardcoded 16:9 dims would stretch portrait or square content.
-        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
-        const aspect = canvas.width / canvas.height;
-        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
-        else             { expH = longSide; expW = Math.round(longSide * aspect); }
-    }
-    const even = ensureEvenDimensions(expW, expH);
-    expW = even.width;
-    expH = even.height;
+    const { w: expW, h: expH } = exportSize(res);
 
     // Create export canvas
     const expCanvas = document.createElement('canvas');
@@ -2115,7 +2211,10 @@ async function exportVideoMediaRecorder(abort) {
     const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
         .find(type => MediaRecorder.isTypeSupported(type)) || '';
 
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const recorder = new MediaRecorder(stream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: exportBitrate(expW, expH, fps),
+    });
     const chunks = [];
 
     recorder.ondataavailable = (e) => {
@@ -2198,18 +2297,7 @@ function exportPng() {
     pause();
 
     const res = el.selectRes.value;
-    let expW, expH;
-    if (res === 'preview') {
-        expW = canvas.width;
-        expH = canvas.height;
-    } else {
-        // Scale the canvas aspect ratio to fit the chosen resolution tier.
-        // Hardcoded 16:9 dims would stretch portrait or square content.
-        const longSide = { '720': 1280, '1080': 1920, '4k': 3840 }[res] || 1920;
-        const aspect = canvas.width / canvas.height;
-        if (aspect >= 1) { expW = longSide; expH = Math.round(longSide / aspect); }
-        else             { expH = longSide; expW = Math.round(longSide * aspect); }
-    }
+    const { w: expW, h: expH } = exportSize(res, { even: false });
 
     const expCanvas = document.createElement('canvas');
     expCanvas.width = expW;
@@ -2285,6 +2373,22 @@ el.btnPatternClear.addEventListener('click', () => {
     commitEdit();
 });
 
+// Time freeze
+el.inputFreezeSpan.addEventListener('input', () => {
+    el.freezeSpanValue.innerText = el.inputFreezeSpan.value;
+});
+document.querySelectorAll('.freeze-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        if (!state.ready) return;
+        applyTimeFreeze(btn.dataset.freeze, parseInt(el.inputFreezeSpan.value, 10) / 100);
+        commitEdit();
+    });
+});
+el.btnUnfreeze.addEventListener('click', () => {
+    clearAllPins();
+    commitEdit();
+});
+
 // Generate
 // Export
 el.btnExportVideo.addEventListener('click', exportVideo);
@@ -2300,6 +2404,20 @@ el.inputDuration.addEventListener('input', () => {
 el.selectFps.addEventListener('change', () => {
     updateCacheInfo();
     if (state.ready) reextractFrames();
+});
+
+// Auto frame quality follows the export resolution — re-extract if the target size moved
+el.selectRes.addEventListener('change', () => {
+    updateCacheInfo();
+    if (state.ready && el.selectCache.value === 'auto') {
+        const target = computeCacheSize(state.totalFrames).w;
+        const current = Math.round(state.video.width * state.frameScaleX);
+        if (Math.abs(target - current) / current > 0.05) {
+            reextractFrames();
+            return;
+        }
+    }
+    updateExportQualityWarning();
 });
 
 // Frame quality defines the cache resolution — re-extract on change

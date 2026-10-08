@@ -143,6 +143,25 @@
             </button>
         </div>
 
+        <!-- TIME FREEZE -->
+        <div class="section">
+            <div class="section-title">TIME FREEZE</div>
+            <div class="slider-row">
+                <div class="slider-head">
+                    <span class="field-label">Span of range</span>
+                    <span class="slider-value"><span id="freezeSpanValue">100</span>%</span>
+                </div>
+                <input type="range" class="slider" id="inputFreezeSpan" min="5" max="100" step="5" value="100" disabled>
+            </div>
+            <div class="btn-grid-2">
+                <button class="btn freeze-btn" data-freeze="lr" type="button" title="Each tile frozen one step later, left→right, row by row" disabled>→ Rows</button>
+                <button class="btn freeze-btn" data-freeze="rl" type="button" title="Same, right→left" disabled>← Rows</button>
+                <button class="btn freeze-btn" data-freeze="tb" type="button" title="Each tile frozen one step later, top→bottom, column by column" disabled>↓ Columns</button>
+                <button class="btn freeze-btn" data-freeze="shuffle" type="button" title="Evenly spaced moments in random tile order" disabled>Shuffle</button>
+            </div>
+            <button class="btn" id="btnUnfreeze" type="button" disabled>Unfreeze all</button>
+        </div>
+
         <!-- SPATIAL SHUFFLE -->
         <div class="section">
             <div class="section-title">SPATIAL SHUFFLE</div>
@@ -220,6 +239,7 @@
                     </select>
                 </div>
             </div>
+            <div class="cache-info warn" id="exportQualityWarn" hidden></div>
 
 
             <label class="toggle">
@@ -274,7 +294,7 @@
             <div class="timeline-legend">
                 <span class="legend-item"><span class="legend-swatch active"></span>active</span>
                 <span class="legend-item"><span class="legend-swatch pinned"></span>pinned</span>
-                <span class="legend-hint">drag ↔ to scrub · right-click or long-press to pin</span>
+                <span class="legend-hint">drag ↔ to scrub (frozen tiles: re-time) · right-click or long-press to freeze/unfreeze</span>
             </div>
         </div>
     </main>
