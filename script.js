@@ -20,7 +20,7 @@ const MIN_CACHE_LONG_SIDE = 480;
 const MAX_EXPORT_DURATION = 300;
 
 const state = {
-    video: { width: 0, height: 0, duration: 0, name: '', size: 0, blobUrl: null, probe: null },
+    video: { width: 0, height: 0, duration: 0, name: '', size: 0, blobUrl: null, probe: null, file: null },
     // Frame cache size relative to the source video (tile src coords are in source pixels)
     frameScaleX: 1,
     frameScaleY: 1,
@@ -271,6 +271,7 @@ function handleFile(file) {
     state.video.name = file.name;
     state.video.size = file.size;
     state.video.blobUrl = URL.createObjectURL(file);
+    state.video.file = file;   // kept for the WebCodecs fast path (reads byte ranges)
 
     loadVideo(state.video.blobUrl);
 }
@@ -491,7 +492,6 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     extractionRunning = true;
     const prevN = state.totalFrames;
     const targetCount = computeSourceFrameCount();
-    const frames = [];
     showLoading(`EXTRACTING ${targetCount} FRAMES`);
     setCancellable(abortExtraction);
 
@@ -503,34 +503,46 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     tCtx.imageSmoothingQuality = 'high';
 
     const rangeDur = state.range.out - state.range.in;
-    const discard = () => {
-        for (const f of new Set(frames)) f.close();
+    const targets = Array.from({ length: targetCount },
+        (_, i) => state.range.in + (i / Math.max(1, targetCount - 1)) * rangeDur);
+    const isCancelled = () => token !== extractionToken;
+    const onProgress = (done) => {
+        el.progressFill.style.width = `${(done / targetCount) * 100}%`;
     };
 
-    for (let i = 0; i < targetCount; i++) {
-        if (token !== extractionToken) { discard(); return false; }
+    // Fast path: demux + sequential WebCodecs decode (MP4/MOV). Falls back to
+    // per-frame seeking for anything it can't handle.
+    let frames = null;
+    let method = 'seek';
+    if (canUseFastExtraction(state.video.file)) {
         try {
-            const t = state.range.in + (i / Math.max(1, targetCount - 1)) * rangeDur;
-            frames.push(await seekAndCapture(probe, tCtx, temp, t));
+            frames = await extractFramesWebCodecs(state.video.file, { targets, tCtx, temp, isCancelled, onProgress });
+            method = 'webcodecs';
         } catch (err) {
-            if (token !== extractionToken) { discard(); return false; }
-            console.warn(`Frame ${i} failed:`, err);
-            if (frames.length > 0) {
-                frames.push(frames[frames.length - 1]);
-            } else {
-                discard();
-                extractionRunning = false;
-                // A failed re-extraction keeps the previous frames (and their range) usable
-                state.ready = state.frames.length > 0 && state.tiles.length > 0;
-                if (state.ready) restoreExtractedSettings();
-                hideLoading();
-                showToast('Frame extraction failed. Try a different video.');
-                return false;
-            }
+            if (isCancelled()) return false;
+            console.info(`Fast extraction unavailable (${err.message}) — using seek extraction`);
+            frames = null;
         }
-        el.progressFill.style.width = `${((i + 1) / targetCount) * 100}%`;
     }
-    if (token !== extractionToken) { discard(); return false; }
+    if (!frames) {
+        el.progressFill.style.width = '0%';
+        frames = await extractFramesSeek(probe, { targets, tCtx, temp, isCancelled, onProgress });
+    }
+    if (isCancelled()) {
+        if (frames) closeBitmaps(frames);
+        return false;
+    }
+    if (!frames) {
+        extractionRunning = false;
+        // A failed re-extraction keeps the previous frames (and their range) usable
+        state.ready = state.frames.length > 0 && state.tiles.length > 0;
+        if (state.ready) restoreExtractedSettings();
+        hideLoading();
+        showToast('Frame extraction failed. Try a different video.');
+        return false;
+    }
+    window.__lastExtractMethod = method;   // read by the test harness
+    console.info(`Extracted ${targetCount} frames via ${method}`);
 
     // Swap in the new frames only once extraction completed
     releaseFrames();
@@ -556,6 +568,32 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     updateStatus();
     onFramesReady({ fresh });
     return true;
+}
+
+function closeBitmaps(frames) {
+    for (const f of new Set(frames)) if (f) f.close();
+}
+
+/**
+ * Original extraction: seek the <video> element to every target time.
+ * Works for every format the browser plays, but each seek decodes from the
+ * previous keyframe. Returns the frames, or null on failure/cancel.
+ */
+async function extractFramesSeek(probe, { targets, tCtx, temp, isCancelled, onProgress }) {
+    const frames = [];
+    for (let i = 0; i < targets.length; i++) {
+        if (isCancelled()) { closeBitmaps(frames); return null; }
+        try {
+            frames.push(await seekAndCapture(probe, tCtx, temp, targets[i]));
+        } catch (err) {
+            if (isCancelled()) { closeBitmaps(frames); return null; }
+            console.warn(`Frame ${i} failed:`, err);
+            if (frames.length === 0) return null;
+            frames.push(frames[frames.length - 1]);
+        }
+        onProgress(i + 1);
+    }
+    return frames;
 }
 
 /**
@@ -629,6 +667,271 @@ function seekAndCapture(probe, tCtx, temp, targetTime) {
         probe.addEventListener('seeked', onSeeked);
         probe.currentTime = targetTime;
     });
+}
+
+/* ==========================================================
+   FAST FRAME EXTRACTION — mp4box.js demux + WebCodecs decode
+   ========================================================== */
+
+// Seeking a <video> element costs a decode from the previous keyframe for
+// every single frame. For MP4/MOV we instead read the sample table with
+// mp4box.js, then decode the needed span once, in order, with VideoDecoder.
+
+const MP4BOX_SRC = 'vendor/mp4box-0.5.4.min.js';
+const DEMUX_CHUNK_BYTES = 4 * 1024 * 1024;
+const SAMPLE_READ_WINDOW = 8 * 1024 * 1024;
+
+let mp4boxLoading = null;
+
+/** Load mp4box.js on first use only. */
+function loadMp4Box() {
+    if (typeof MP4Box !== 'undefined') return Promise.resolve();
+    if (!mp4boxLoading) {
+        mp4boxLoading = new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = MP4BOX_SRC;
+            s.onload = resolve;
+            s.onerror = () => { mp4boxLoading = null; reject(new Error('mp4box failed to load')); };
+            document.head.appendChild(s);
+        });
+    }
+    return mp4boxLoading;
+}
+
+function canUseFastExtraction(file) {
+    if (!file || typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') return false;
+    return /^video\/(mp4|quicktime|x-m4v)$/.test(file.type) || /\.(mp4|m4v|mov)$/i.test(file.name);
+}
+
+/** Parse the moov box. Skips over mdat: mp4box tells us the next offset it needs. */
+async function demuxMp4(file, isCancelled) {
+    await loadMp4Box();
+    const mp4 = MP4Box.createFile();
+    let info = null;
+    let error = null;
+    mp4.onReady = (i) => { info = i; };
+    mp4.onError = (e) => { error = e; };
+
+    let pos = 0;
+    while (!info && !error && pos < file.size) {
+        if (isCancelled()) return null;
+        const buf = await file.slice(pos, pos + DEMUX_CHUNK_BYTES).arrayBuffer();
+        buf.fileStart = pos;
+        const next = mp4.appendBuffer(buf);
+        pos = (typeof next === 'number' && next > pos) ? next : pos + buf.byteLength;
+    }
+    if (error) throw new Error(`demux error: ${error}`);
+    if (!info) throw new Error('no movie header found');
+
+    const track = info.videoTracks[0];
+    if (!track) throw new Error('no video track');
+    const trak = mp4.getTrackById(track.id);
+    if (!trak || !trak.samples || trak.samples.length === 0) throw new Error('empty sample table');
+    return { info, track, trak };
+}
+
+/**
+ * tkhd matrix → clockwise display rotation in degrees (0/90/180/270),
+ * or null for anything that isn't a pure quarter turn.
+ */
+function matrixRotation(matrix) {
+    if (!matrix) return 0;
+    const [a, b, , c, d] = Array.from(matrix).map(v => v / 65536);
+    const is = (v, t) => Math.abs(v - t) < 1e-3;
+    if (is(a, 1) && is(b, 0) && is(c, 0) && is(d, 1)) return 0;
+    if (is(a, 0) && is(b, 1) && is(c, -1) && is(d, 0)) return 90;
+    if (is(a, -1) && is(b, 0) && is(c, 0) && is(d, -1)) return 180;
+    if (is(a, 0) && is(b, -1) && is(c, 1) && is(d, 0)) return 270;
+    return null;
+}
+
+/** avcC / hvcC / vpcC / av1C payload for VideoDecoder.configure(). */
+function codecDescription(trak) {
+    for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+        if (box) {
+            const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+            box.write(stream);
+            return new Uint8Array(stream.buffer, 8);   // strip the box header
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Edit list → offset (seconds) between sample composition time and the
+ * presentation time the <video> element uses (e.g. B-frame priming delay).
+ */
+function editListOffset(trak, movieTimescale) {
+    const entries = trak.edts && trak.edts.elst && trak.edts.elst.entries;
+    if (!entries || entries.length === 0) return 0;
+    const mediaTimescale = trak.mdia.mdhd.timescale;
+    let offset = 0;
+    for (const e of entries) {
+        if (e.media_time === -1) {             // empty edit: delays the track
+            offset += e.segment_duration / movieTimescale;
+            continue;
+        }
+        offset -= e.media_time / mediaTimescale;
+        break;
+    }
+    return offset;
+}
+
+/** Reads sample payloads through a sliding window instead of one read per sample. */
+function createSampleReader(file) {
+    let winStart = 0;
+    let winBuf = null;
+    return async (offset, size) => {
+        if (!winBuf || offset < winStart || offset + size > winStart + winBuf.byteLength) {
+            winStart = offset;
+            winBuf = await file.slice(offset, offset + Math.max(SAMPLE_READ_WINDOW, size)).arrayBuffer();
+        }
+        return new Uint8Array(winBuf, offset - winStart, size);
+    };
+}
+
+/**
+ * Decode every frame between the keyframe before the first target and the
+ * keyframe after the last one, keeping the frame shown at each target time.
+ * Throws if the file/codec isn't suitable (caller falls back to seeking);
+ * returns null if cancelled.
+ */
+async function extractFramesWebCodecs(file, { targets, tCtx, temp, isCancelled, onProgress }) {
+    const demux = await demuxMp4(file, isCancelled);
+    if (!demux) return null;
+    const { info, track, trak } = demux;
+
+    // Phone footage carries a rotation matrix the <video> element applies;
+    // replicate quarter turns, leave anything else to the seek path.
+    const rotation = matrixRotation(track.matrix);
+    if (rotation === null) throw new Error('unsupported transform matrix');
+    const swap = rotation === 90 || rotation === 270;
+    const dispW = swap ? track.video.height : track.video.width;
+    const dispH = swap ? track.video.width : track.video.height;
+    if (Math.abs(dispW - state.video.width) > 2 || Math.abs(dispH - state.video.height) > 2) {
+        throw new Error('display size differs from coded size');
+    }
+
+    const config = {
+        codec: track.codec,
+        codedWidth: track.video.width,
+        codedHeight: track.video.height,
+        description: codecDescription(trak),
+        optimizeForLatency: false,
+    };
+    const support = await VideoDecoder.isConfigSupported(config).catch(() => null);
+    if (!support || !support.supported) throw new Error(`codec ${track.codec} not supported`);
+
+    const timescale = trak.mdia.mdhd.timescale;
+    const offset = editListOffset(trak, info.timescale);
+    const samples = trak.samples;   // decode order
+    const ptsOf = (smp) => smp.cts / timescale + offset;
+    const firstT = targets[0];
+    const lastT = targets[targets.length - 1];
+
+    // Start at the last keyframe at or before the first target...
+    let startIdx = 0;
+    for (let i = 0; i < samples.length; i++) {
+        if (samples[i].is_sync && ptsOf(samples[i]) <= firstT + 1e-6) startIdx = i;
+    }
+    // ...and stop at the first keyframe after the last target (all frames before it decode).
+    let endIdx = samples.length;
+    for (let i = startIdx + 1; i < samples.length; i++) {
+        if (samples[i].is_sync && ptsOf(samples[i]) > lastT) { endIdx = i; break; }
+    }
+
+    const frames = new Array(targets.length).fill(null);
+    let ti = 0;                 // next target to fill
+    let held = null;            // latest decoded frame (presentation order)
+    let heldBitmap = null;      // its bitmap, once a target needed it
+    let decodeError = null;
+    let outputChain = Promise.resolve();
+    let pendingOutputs = 0;
+
+    const W = temp.width, H = temp.height;
+    const bitmapFor = async (frame) => {
+        tCtx.save();
+        if (rotation === 90) { tCtx.translate(W, 0); tCtx.rotate(Math.PI / 2); }
+        else if (rotation === 180) { tCtx.translate(W, H); tCtx.rotate(Math.PI); }
+        else if (rotation === 270) { tCtx.translate(0, H); tCtx.rotate(-Math.PI / 2); }
+        if (swap) tCtx.drawImage(frame, 0, 0, H, W);
+        else tCtx.drawImage(frame, 0, 0, W, H);
+        tCtx.restore();
+        return createImageBitmap(temp);
+    };
+    // Every target before time t is shown by the held frame.
+    const fillUntil = async (t) => {
+        while (ti < targets.length && targets[ti] < t - 1e-6) {
+            if (!heldBitmap) heldBitmap = await bitmapFor(held);
+            frames[ti++] = heldBitmap;
+        }
+        onProgress(ti);
+    };
+    const handleFrame = async (frame) => {
+        const t = frame.timestamp / 1e6;
+        if (!held) {
+            held = frame;
+            await fillUntil(t);   // targets before the first frame get the first frame
+            return;
+        }
+        await fillUntil(t);
+        held.close();
+        held = frame;
+        heldBitmap = null;
+    };
+
+    const decoder = new VideoDecoder({
+        output: (frame) => {
+            pendingOutputs++;
+            outputChain = outputChain
+                .then(() => (isCancelled() || decodeError) ? frame.close() : handleFrame(frame))
+                .catch((err) => { decodeError = decodeError || err; frame.close(); })
+                .finally(() => { pendingOutputs--; });
+        },
+        error: (err) => { decodeError = decodeError || err; },
+    });
+
+    const cleanup = () => {
+        if (decoder.state !== 'closed') decoder.close();
+        if (held) held.close();
+        held = null;
+        closeBitmaps(frames.filter(Boolean));
+    };
+
+    try {
+        decoder.configure(config);
+        const read = createSampleReader(file);
+        for (let i = startIdx; i < endIdx; i++) {
+            if (isCancelled()) { await outputChain; cleanup(); return null; }
+            if (decodeError) throw decodeError;
+            // Backpressure: decoder input queue and our bitmap conversion queue
+            while (decoder.decodeQueueSize > 8 || pendingOutputs > 4) {
+                await new Promise(r => setTimeout(r, 2));
+            }
+            const smp = samples[i];
+            decoder.decode(new EncodedVideoChunk({
+                type: smp.is_sync ? 'key' : 'delta',
+                timestamp: Math.round(ptsOf(smp) * 1e6),
+                duration: Math.round(smp.duration / timescale * 1e6),
+                data: await read(smp.offset, smp.size),
+            }));
+        }
+        await decoder.flush();
+        await outputChain;
+        if (decodeError) throw decodeError;
+        if (isCancelled()) { cleanup(); return null; }
+        if (!held) throw new Error('decoder produced no frames');
+        await fillUntil(Infinity);   // targets after the last frame keep the last frame
+        held.close();
+        held = null;
+        decoder.close();
+        return frames;
+    } catch (err) {
+        await outputChain.catch(() => {});
+        cleanup();
+        throw err;
+    }
 }
 
 /* ==========================================================
