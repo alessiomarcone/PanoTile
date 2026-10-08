@@ -9,11 +9,21 @@
 const MIN_SOURCE_FRAMES = 30;     // below this, scrubbing feels choppy
 const MAX_SOURCE_FRAMES = 1800;   // 60s × 30fps — hard ceiling
 
-const MAX_FILE_BYTES = 200 * 1024 * 1024;
+// The video is streamed from a blob URL (never read into memory), so the file
+// size limit is generous — memory is governed by the frame cache budget below.
+const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_CANVAS_DIM = 1000;
+
+// Frame cache: decoded frames are stored as RGBA bitmaps (4 bytes/px).
+// They are downscaled so the whole cache fits a memory budget.
+const MIN_CACHE_LONG_SIDE = 480;
+const MAX_EXPORT_DURATION = 300;
 
 const state = {
     video: { width: 0, height: 0, duration: 0, name: '', size: 0, blobUrl: null, probe: null },
+    // Frame cache size relative to the source video (tile src coords are in source pixels)
+    frameScaleX: 1,
+    frameScaleY: 1,
     range: { in: 0, out: 0 },
     totalFrames: 0,
     frames: [],
@@ -116,6 +126,14 @@ const el = {
     selectLoop: $('selectLoop'),
     inputStutter: $('inputStutter'),
     stutterValue: $('stutterValue'),
+    selectCache: $('selectCache'),
+    cacheInfo: $('cacheInfo'),
+    btnProjectSave: $('btnProjectSave'),
+    btnProjectOpen: $('btnProjectOpen'),
+    projectUpload: $('projectUpload'),
+    btnUndo: $('btnUndo'),
+    btnRedo: $('btnRedo'),
+    btnCancelTask: $('btnCancelTask'),
 };
 
 /* ==========================================================
@@ -140,7 +158,8 @@ function formatTime(sec) {
 
 function formatBytes(b) {
     if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
-    return (b / (1024 * 1024)).toFixed(1) + ' MB';
+    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
+    return (b / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
 function confirm(title, msg, okLabel = 'Confirm') {
@@ -222,7 +241,7 @@ el.videoUpload.addEventListener('change', (e) => {
 function handleFile(file) {
     if (!file) return;
     if (file.size > MAX_FILE_BYTES) {
-        showToast(`File too large (${formatBytes(file.size)}, max 200 MB)`);
+        showToast(`File too large (${formatBytes(file.size)}, max ${formatBytes(MAX_FILE_BYTES)})`);
         return;
     }
     // Some OSes report an empty MIME type — fall back to the extension.
@@ -245,6 +264,7 @@ function handleFile(file) {
     if (state.video.blobUrl) URL.revokeObjectURL(state.video.blobUrl);
 
     state.ready = false;
+    lastExtracted = null;
     state.tiles = [];
     state.hoverTile = null;
     state.activeTile = null;
@@ -315,7 +335,7 @@ function loadVideo(src) {
         const defaultExportDur = Math.min(10, Math.max(2, rangeDur));
         el.inputDuration.value = defaultExportDur;
         el.durationValue.innerText = defaultExportDur.toFixed(1);
-        el.inputDuration.max = Math.min(60, probe.duration).toFixed(1);
+        el.inputDuration.max = MAX_EXPORT_DURATION;
 
         updateSourceCard();
         el.sectionRange.style.display = 'flex';
@@ -373,6 +393,49 @@ function updateSourceCard() {
    FRAME EXTRACTION — dynamic count based on range × fps
    ========================================================== */
 
+/**
+ * Memory budget for the frame cache. navigator.deviceMemory is Chromium-only;
+ * elsewhere assume 4 GB. Budget = 15% of it, clamped 0.5–1.5 GB — a browser tab
+ * also needs room for decoding, export canvases and the encoder.
+ */
+function frameCacheBudget() {
+    const gb = navigator.deviceMemory || 4;
+    return Math.min(1.5, Math.max(0.5, gb * 0.15)) * 1024 * 1024 * 1024;
+}
+
+/** Size of each cached frame for `count` frames, honouring the quality selector. */
+function computeCacheSize(count) {
+    const vW = state.video.width, vH = state.video.height;
+    const longSide = Math.max(vW, vH);
+    const pref = el.selectCache ? el.selectCache.value : 'auto';
+    const budget = frameCacheBudget();
+    let scale = 1;
+
+    if (pref === 'auto') {
+        scale = Math.min(1, Math.sqrt(budget / (count * vW * vH * 4)));
+        scale = Math.max(scale, Math.min(1, MIN_CACHE_LONG_SIDE / longSide));
+    } else if (pref !== 'full') {
+        scale = Math.min(1, parseInt(pref, 10) / longSide);
+    }
+
+    // Auto rounds down so the result never lands a few bytes over the budget
+    const round = pref === 'auto' ? Math.floor : Math.round;
+    const w = Math.max(2, round(vW * scale));
+    const h = Math.max(2, round(vH * scale));
+    const bytes = count * w * h * 4;
+    return { w, h, bytes, budget, overBudget: bytes > budget };
+}
+
+/** Live estimate shown under the range selector. */
+function updateCacheInfo() {
+    if (!el.cacheInfo || !state.video.width) return;
+    const count = computeSourceFrameCount();
+    const c = computeCacheSize(count);
+    el.cacheInfo.textContent = `${count} frames · ${c.w}×${c.h} · ≈${formatBytes(c.bytes)}`
+        + (c.overBudget ? ` — over the ~${formatBytes(c.budget)} budget, may crash` : '');
+    el.cacheInfo.classList.toggle('warn', c.overBudget);
+}
+
 function computeSourceFrameCount() {
     // Source frame count = range_duration × fps.
     // This is independent of export duration — duration only controls
@@ -390,7 +453,29 @@ function computeSourceFrameCount() {
 // invalidates the previous loop so two extractions never write into the same list.
 let extractionToken = 0;
 let extractionRunning = false;
-let lastExtractedRange = null;   // range the current frames were sampled from
+// Range / fps / quality the current frames were sampled with
+let lastExtracted = null;
+
+function restoreExtractedSettings() {
+    if (!lastExtracted) return;
+    state.range = { ...lastExtracted.range };
+    el.selectFps.value = lastExtracted.fps;
+    el.selectCache.value = lastExtracted.cache;
+    renderRangeUI();
+}
+
+/** Stop an in-flight extraction; a re-extraction falls back to the previous frames. */
+function abortExtraction() {
+    cancelExtraction();
+    extractionRunning = false;
+    hideLoading();
+    state.ready = state.frames.length > 0 && state.tiles.length > 0;
+    if (state.ready) {
+        restoreExtractedSettings();
+        renderAll();
+    }
+    showToast('Frame extraction cancelled', 'info');
+}
 
 function cancelExtraction() {
     extractionToken++;
@@ -408,11 +493,14 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     const targetCount = computeSourceFrameCount();
     const frames = [];
     showLoading(`EXTRACTING ${targetCount} FRAMES`);
+    setCancellable(abortExtraction);
 
+    const cache = computeCacheSize(targetCount);
     const temp = document.createElement('canvas');
-    temp.width = state.video.width;
-    temp.height = state.video.height;
+    temp.width = cache.w;
+    temp.height = cache.h;
     const tCtx = temp.getContext('2d');
+    tCtx.imageSmoothingQuality = 'high';
 
     const rangeDur = state.range.out - state.range.in;
     const discard = () => {
@@ -420,12 +508,12 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     };
 
     for (let i = 0; i < targetCount; i++) {
-        if (token !== extractionToken) { discard(); return; }
+        if (token !== extractionToken) { discard(); return false; }
         try {
             const t = state.range.in + (i / Math.max(1, targetCount - 1)) * rangeDur;
             frames.push(await seekAndCapture(probe, tCtx, temp, t));
         } catch (err) {
-            if (token !== extractionToken) { discard(); return; }
+            if (token !== extractionToken) { discard(); return false; }
             console.warn(`Frame ${i} failed:`, err);
             if (frames.length > 0) {
                 frames.push(frames[frames.length - 1]);
@@ -434,24 +522,23 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
                 extractionRunning = false;
                 // A failed re-extraction keeps the previous frames (and their range) usable
                 state.ready = state.frames.length > 0 && state.tiles.length > 0;
-                if (state.ready && lastExtractedRange) {
-                    state.range = { ...lastExtractedRange };
-                    renderRangeUI();
-                }
+                if (state.ready) restoreExtractedSettings();
                 hideLoading();
                 showToast('Frame extraction failed. Try a different video.');
-                return;
+                return false;
             }
         }
         el.progressFill.style.width = `${((i + 1) / targetCount) * 100}%`;
     }
-    if (token !== extractionToken) { discard(); return; }
+    if (token !== extractionToken) { discard(); return false; }
 
     // Swap in the new frames only once extraction completed
     releaseFrames();
     state.frames = frames;
     state.totalFrames = targetCount;
-    lastExtractedRange = { ...state.range };
+    state.frameScaleX = cache.w / state.video.width;
+    state.frameScaleY = cache.h / state.video.height;
+    lastExtracted = { range: { ...state.range }, fps: el.selectFps.value, cache: el.selectCache.value };
     extractionRunning = false;
 
     hideLoading();
@@ -460,12 +547,15 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
     el.timeline.classList.add('visible');
     state.ready = true;
     enableControls();
-    if (keepProject && state.tiles.length > 0) {
-        remapProjectFrames(prevRange || { ...state.range }, prevN, targetCount);
-    } else {
+    const fresh = !(keepProject && state.tiles.length > 0);
+    if (fresh) {
         initProject();
+    } else {
+        remapProjectFrames(prevRange || { ...state.range }, prevN);
     }
     updateStatus();
+    onFramesReady({ fresh });
+    return true;
 }
 
 /**
@@ -473,7 +563,19 @@ async function extractFrames(probe, { keepProject = false, prevRange = null } = 
  * Pinned frames stay on the same moment of the video (clamped to the new range);
  * offsets and phases keep the same duration in seconds.
  */
-function remapProjectFrames(prevRange, prevN, newN) {
+function remapProjectFrames(prevRange, prevN) {
+    const k = remapTileFrames(prevRange, prevN);
+    anim.tilePhases = anim.tilePhases.map(p => p * k);
+    renderAll();
+    updateTimeline();
+}
+
+/**
+ * Map tile frame indices/offsets sampled with (prevRange, prevN) onto the
+ * current range and frame count. Returns the frame-rate ratio new/prev.
+ */
+function remapTileFrames(prevRange, prevN) {
+    const newN = state.totalFrames;
     const prevDur = Math.max(0.1, prevRange.out - prevRange.in);
     const newDur = Math.max(0.1, state.range.out - state.range.in);
     const prevRate = Math.max(1, prevN - 1) / prevDur;
@@ -486,9 +588,7 @@ function remapProjectFrames(prevRange, prevN, newN) {
         t.frameIndex = clamp(Math.round((time - state.range.in) * newRate), 0, newN - 1);
         t.frameOffset = clamp(Math.round(t.frameOffset * k), -(newN - 1), newN - 1);
     }
-    anim.tilePhases = anim.tilePhases.map(p => p * k);
-    renderAll();
-    updateTimeline();
+    return k;
 }
 
 /** Re-extract frames after range or fps change. */
@@ -497,7 +597,7 @@ function reextractFrames() {
     const hadProject = state.tiles.length > 0;
     pause();
     state.ready = false;
-    extractFrames(state.video.probe, { keepProject: hadProject, prevRange: lastExtractedRange });
+    extractFrames(state.video.probe, { keepProject: hadProject, prevRange: lastExtracted && lastExtracted.range });
 }
 
 function seekAndCapture(probe, tCtx, temp, targetTime) {
@@ -510,7 +610,7 @@ function seekAndCapture(probe, tCtx, temp, targetTime) {
             probe.removeEventListener('seeked', onSeeked);
             clearTimeout(t);
             try {
-                tCtx.drawImage(probe, 0, 0);
+                tCtx.drawImage(probe, 0, 0, temp.width, temp.height);
                 // ImageBitmap: GPU-ready handle, ~10× faster drawImage than HTML Image,
                 // and no base64 encode/decode roundtrip.
                 resolve(await createImageBitmap(temp));
@@ -601,6 +701,7 @@ function renderRangeUI() {
     el.rangeOut.innerText = formatTime(state.range.out);
     const rd = state.range.out - state.range.in;
     el.rangeDur.innerText = rd.toFixed(2) + 's';
+    updateCacheInfo();
 }
 
 // Drag handles for range selector
@@ -837,7 +938,7 @@ function renderAll() {
     for (const t of state.tiles) {
         const img = state.frames[t.frameIndex];
         if (img) {
-            ctx.drawImage(img, t.srcX, t.srcY, t.srcW, t.srcH, t.x, t.y, t.w, t.h);
+            drawTileFrame(ctx, img, t, t.x, t.y, t.w, t.h);
         }
     }
 
@@ -863,6 +964,12 @@ function renderAll() {
 
         if (el.checkGrid.checked) drawGrid();
     }
+}
+
+/** Draw a tile's source crop. Tile src coords are in source pixels; the cache may be downscaled. */
+function drawTileFrame(c, img, tile, dx, dy, dw, dh) {
+    const sx = state.frameScaleX, sy = state.frameScaleY;
+    c.drawImage(img, tile.srcX * sx, tile.srcY * sy, tile.srcW * sx, tile.srcH * sy, dx, dy, dw, dh);
 }
 
 function drawGrid() {
@@ -1013,6 +1120,7 @@ const endDrag = () => {
         document.body.style.cursor = '';
         renderAll();
         updateTimeline();
+        commitEdit();
     }
 };
 canvas.addEventListener('pointerup', endDrag);
@@ -1027,6 +1135,7 @@ canvas.addEventListener('contextmenu', (e) => {
         renderAll();
         updateStatus();
         updateTimeline();
+        commitEdit();
     }
 });
 
@@ -1055,6 +1164,7 @@ canvas.addEventListener('pointerdown', (e) => {
         updateTimeline();
         longPressTile = null;
         longPressTimer = null;
+        commitEdit();
     }, 500);
 });
 
@@ -1311,7 +1421,24 @@ function showLoading(msg) {
 
 function hideLoading() {
     el.loadingOverlay.classList.remove('visible');
+    setCancellable(null);
 }
+
+// Long tasks (extraction, export) can register a cancel handler for the overlay button / Esc
+let cancelHandler = null;
+
+function setCancellable(fn) {
+    cancelHandler = fn;
+    el.loadingOverlay.classList.toggle('cancellable', !!fn);
+}
+
+function cancelCurrentTask() {
+    const fn = cancelHandler;
+    setCancellable(null);
+    if (fn) fn();
+}
+
+el.btnCancelTask.addEventListener('click', cancelCurrentTask);
 
 /* ==========================================================
    CONTROLS
@@ -1336,6 +1463,7 @@ function enableControls() {
     el.selectFps.disabled = false;
     el.checkLoop.disabled = false;
     el.btnPlayPause.disabled = false;
+    el.btnProjectSave.disabled = false;
     if (el.selectLoop) el.selectLoop.disabled = false;
     if (el.inputStutter) el.inputStutter.disabled = false;
 }
@@ -1371,29 +1499,67 @@ function ensureEvenDimensions(w, h) {
 /**
  * Export video — always stops preview first.
  */
+function exportFilename(ext) {
+    const res = el.selectRes.value;
+    const fps = parseInt(el.selectFps.value, 10);
+    const dur = parseFloat(el.inputDuration.value);
+    const resLabel = res === 'preview' ? `${canvas.width}x${canvas.height}` : res;
+    return `PanoTile-${resLabel}-${fps}fps-${dur}s-${Date.now()}.${ext}`;
+}
+
+function cancelledError() {
+    return new DOMException('Export cancelled', 'AbortError');
+}
+
 async function exportVideo() {
     if (state.isExporting || !state.ready || extractionRunning) return;
+
+    const path = getExportPath();
+
+    // Stream long exports straight to disk where supported (Chromium File System
+    // Access API) so the MP4 never has to fit in memory. The picker must open
+    // first, while the click still counts as a user gesture.
+    let fileHandle = null;
+    if (path === 'A' && typeof window.showSaveFilePicker === 'function') {
+        try {
+            fileHandle = await window.showSaveFilePicker({
+                suggestedName: exportFilename('mp4'),
+                types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }],
+            });
+        } catch (err) {
+            if (err.name === 'AbortError') return;   // user closed the save dialog
+            fileHandle = null;                        // picker unavailable — in-memory download
+        }
+    }
 
     // Stop preview before export
     pause();
 
     state.isExporting = true;
     updateStatus();
-    const path = getExportPath();
     // Path B records in real time and stalls in background tabs
     showLoading(path === 'A' ? 'EXPORTING...' : 'EXPORTING IN REAL TIME — KEEP THIS TAB VISIBLE');
+    const abort = { cancelled: false };
+    setCancellable(() => {
+        abort.cancelled = true;
+        if (el.loadingText) el.loadingText.innerText = 'CANCELLING...';
+    });
 
-    console.log(`Export path: ${path} (${path === 'A' ? 'WebCodecs+mp4-muxer' : 'MediaRecorder fallback'})`);
+    console.log(`Export path: ${path} (${path === 'A' ? 'WebCodecs+mp4-muxer' : 'MediaRecorder fallback'}${fileHandle ? ', streaming to disk' : ''})`);
 
     try {
         if (path === 'A') {
-            await exportVideoWebCodecs();
+            await exportVideoWebCodecs(abort, fileHandle);
         } else {
-            await exportVideoMediaRecorder();
+            await exportVideoMediaRecorder(abort);
         }
     } catch (err) {
-        console.error('Export failed:', err);
-        showToast(`Export failed: ${err.message || 'Unknown error'}`);
+        if (err && err.name === 'AbortError') {
+            showToast('Export cancelled', 'info');
+        } else {
+            console.error('Export failed:', err);
+            showToast(`Export failed: ${err.message || 'Unknown error'}`);
+        }
     } finally {
         hideLoading();
         state.isExporting = false;
@@ -1404,7 +1570,7 @@ async function exportVideo() {
 /**
  * Path A: WebCodecs + mp4-muxer (Primary - MP4 H.264)
  */
-async function exportVideoWebCodecs() {
+async function exportVideoWebCodecs(abort, fileHandle = null) {
     const fps = parseInt(el.selectFps.value, 10);
     const dur = parseFloat(el.inputDuration.value);
     const res = el.selectRes.value;
@@ -1436,19 +1602,23 @@ async function exportVideoWebCodecs() {
     expCanvas.width = expW;
     expCanvas.height = expH;
     const expCtx = expCanvas.getContext('2d');
+    expCtx.imageSmoothingQuality = 'high';
     // Fresh phase state so the export is deterministic and never mutates the preview
     const exportPhases = createInitialPhases();
 
-    // Setup mp4-muxer
+    // Setup mp4-muxer — disk stream (moov at the end) or in-memory buffer (moov first)
+    const writable = fileHandle ? await fileHandle.createWritable() : null;
     const muxer = new Mp4Muxer.Muxer({
-        target: new Mp4Muxer.ArrayBufferTarget(),
+        target: writable
+            ? new Mp4Muxer.FileSystemWritableFileStreamTarget(writable)
+            : new Mp4Muxer.ArrayBufferTarget(),
         video: {
             codec: 'avc',
             width: expW,
             height: expH,
             bitrate: bitrate
         },
-        fastStart: 'in-memory'
+        fastStart: writable ? false : 'in-memory'
     });
 
     // Pick the minimum H.264 level that covers the actual pixel area.
@@ -1479,69 +1649,81 @@ async function exportVideoWebCodecs() {
         framerate: fps
     };
 
-    // Fail fast (before rendering anything) if the GPU/browser can't encode this size
-    const support = await VideoEncoder.isConfigSupported(encoderConfig).catch(() => null);
-    if (!support || !support.supported) {
-        encoder.close();
-        throw new Error(`H.264 ${expW}×${expH} is not supported by this browser — try a lower resolution`);
-    }
-    encoder.configure(encoderConfig);
+    try {
+        // Fail fast (before rendering anything) if the GPU/browser can't encode this size
+        const support = await VideoEncoder.isConfigSupported(encoderConfig).catch(() => null);
+        if (!support || !support.supported) {
+            throw new Error(`H.264 ${expW}×${expH} is not supported by this browser — try a lower resolution`);
+        }
+        encoder.configure(encoderConfig);
 
-    // Render each frame
-    for (let i = 0; i < totalFrames; i++) {
-        // Backpressure: wait if queue is too large
-        while (encoder.encodeQueueSize > 10) {
+        // Render each frame
+        for (let i = 0; i < totalFrames; i++) {
+            if (abort.cancelled) throw cancelledError();
+
+            // Backpressure: wait if queue is too large
+            while (encoder.encodeQueueSize > 10) {
+                await new Promise(r => setTimeout(r, 10));
+            }
+
+            // Re-throw the real encoder error if one occurred
+            if (encoderError) throw encoderError;
+            if (encoder.state === 'closed') {
+                throw new Error('VideoEncoder closed unexpectedly during export');
+            }
+
+            // Render the frame at output frame i
+            renderExportFrame(expCtx, expCanvas, i, totalFrames, fps, exportPhases);
+
+            // Create VideoFrame
+            const videoFrame = new VideoFrame(expCanvas, {
+                timestamp: i * 1_000_000 / fps, // microseconds
+                duration: Math.round(1_000_000 / fps)
+            });
+
+            encoder.encode(videoFrame);
+            videoFrame.close(); // GC: close immediately after encode
+
+            frameCount++;
+
+            // Update progress
+            el.progressFill.style.width = `${((i + 1) / totalFrames) * 100}%`;
+        }
+
+        // Wait for all pending encodes to complete before flushing
+        // This prevents "Cannot call 'encode' on a closed codec" errors
+        while (encoder.encodeQueueSize > 0) {
             await new Promise(r => setTimeout(r, 10));
         }
 
-        // Re-throw the real encoder error if one occurred
-        if (encoderError) throw encoderError;
-        if (encoder.state === 'closed') {
-            throw new Error('VideoEncoder closed unexpectedly during export');
+        // Finalize
+        await encoder.flush();
+        encoder.close();
+        if (abort.cancelled) throw cancelledError();
+        muxer.finalize();
+
+        if (writable) {
+            await writable.close();   // waits for every queued write to land on disk
+            const file = await fileHandle.getFile().catch(() => null);
+            showToast(`Saved ${fileHandle.name}${file ? ` (${formatBytes(file.size)})` : ''}`, 'info');
+            return;
         }
 
-        // Render the frame at output frame i
-        renderExportFrame(expCtx, expCanvas, i, totalFrames, fps, exportPhases);
+        // Get the buffer
+        const buffer = muxer.target.buffer;
+        const blob = new Blob([buffer], { type: 'video/mp4' });
+        const filename = exportFilename('mp4');
 
-        // Create VideoFrame
-        const videoFrame = new VideoFrame(expCanvas, {
-            timestamp: i * 1_000_000 / fps, // microseconds
-            duration: Math.round(1_000_000 / fps)
-        });
+        // Download
+        downloadBlob(blob, filename);
 
-        encoder.encode(videoFrame);
-        videoFrame.close(); // GC: close immediately after encode
-
-        frameCount++;
-
-        // Update progress
-        el.progressFill.style.width = `${((i + 1) / totalFrames) * 100}%`;
+        showToast(`Exported ${filename} (${formatBytes(blob.size)})`, 'info');
+    } catch (err) {
+        if (encoder.state !== 'closed') encoder.close();
+        // Discard the partially written file contents
+        if (writable) await writable.abort().catch(() => {});
+        throw err;
     }
-
-    // Wait for all pending encodes to complete before flushing
-    // This prevents "Cannot call 'encode' on a closed codec" errors
-    while (encoder.encodeQueueSize > 0) {
-        await new Promise(r => setTimeout(r, 10));
-    }
-
-    // Finalize
-    await encoder.flush();
-    encoder.close();
-    muxer.finalize();
-
-    // Get the buffer
-    const buffer = muxer.target.buffer;
-    const blob = new Blob([buffer], { type: 'video/mp4' });
-
-    // Generate filename
-    const resLabel = res === 'preview' ? `${canvas.width}x${canvas.height}` : res;
-    const ts = Date.now();
-    const filename = `PanoTile-${resLabel}-${fps}fps-${dur}s-${ts}.mp4`;
-
-    // Download
-    downloadBlob(blob, filename);
-
-    showToast(`Exported ${filename} (${formatBytes(blob.size)})`, 'info');
 }
 
 /**
@@ -1576,12 +1758,7 @@ function renderExportFrame(expCtx, expCanvas, outputFrame, totalFrames, fps, exp
         const img = state.frames[fi];
         if (img) {
             // Draw at export resolution
-            expCtx.drawImage(
-                img,
-                tile.srcX, tile.srcY, tile.srcW, tile.srcH,
-                tile.x * scaleX, tile.y * scaleY,
-                tile.w * scaleX, tile.h * scaleY
-            );
+            drawTileFrame(expCtx, img, tile, tile.x * scaleX, tile.y * scaleY, tile.w * scaleX, tile.h * scaleY);
         }
     }
 }
@@ -1589,7 +1766,7 @@ function renderExportFrame(expCtx, expCanvas, outputFrame, totalFrames, fps, exp
 /**
  * Path B: MediaRecorder (Fallback - WebM)
  */
-async function exportVideoMediaRecorder() {
+async function exportVideoMediaRecorder(abort) {
     const fps = parseInt(el.selectFps.value, 10);
     const dur = parseFloat(el.inputDuration.value);
     const res = el.selectRes.value;
@@ -1617,6 +1794,7 @@ async function exportVideoMediaRecorder() {
     expCanvas.width = expW;
     expCanvas.height = expH;
     const expCtx = expCanvas.getContext('2d');
+    expCtx.imageSmoothingQuality = 'high';
     // Fresh phase state so the export is deterministic and never mutates the preview
     const exportPhases = createInitialPhases();
 
@@ -1648,7 +1826,18 @@ async function exportVideoMediaRecorder() {
     // a 30fps export play at 2× on a 60Hz screen. This path runs in real time.
     const frameMs = 1000 / fps;
     const t0 = performance.now();
+    const stopRecording = async () => {
+        const stopPromise = new Promise(r => { recorder.onstop = r; });
+        if (recorder.state !== 'inactive') recorder.stop();
+        else return;
+        await stopPromise;
+    };
     for (let i = 0; i < totalFrames; i++) {
+        if (abort.cancelled) {
+            await stopRecording();
+            for (const track of stream.getTracks()) track.stop();
+            throw cancelledError();
+        }
         renderExportFrame(expCtx, expCanvas, i, totalFrames, fps, exportPhases);
         if (videoTrack && typeof videoTrack.requestFrame === 'function') {
             videoTrack.requestFrame();
@@ -1663,18 +1852,12 @@ async function exportVideoMediaRecorder() {
     // Flush: wait 300ms before stopping
     await new Promise(r => setTimeout(r, 300));
 
-    // Set onstop BEFORE calling stop() to avoid race condition
-    const stopPromise = new Promise(r => { recorder.onstop = r; });
-    recorder.stop();
-    await stopPromise;
+    // onstop is set before stop() to avoid a race
+    await stopRecording();
     for (const track of stream.getTracks()) track.stop();
 
     const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
-
-    // Generate filename
-    const resLabel = res === 'preview' ? `${canvas.width}x${canvas.height}` : res;
-    const ts = Date.now();
-    const filename = `PanoTile-${resLabel}-${fps}fps-${dur}s-${ts}.webm`;
+    const filename = exportFilename('webm');
 
     downloadBlob(blob, filename);
 
@@ -1729,6 +1912,7 @@ function exportPng() {
     expCanvas.width = expW;
     expCanvas.height = expH;
     const expCtx = expCanvas.getContext('2d');
+    expCtx.imageSmoothingQuality = 'high';
 
     const scaleX = expW / canvas.width;
     const scaleY = expH / canvas.height;
@@ -1736,12 +1920,7 @@ function exportPng() {
     for (const tile of state.tiles) {
         const img = state.frames[tile.frameIndex];
         if (img) {
-            expCtx.drawImage(
-                img,
-                tile.srcX, tile.srcY, tile.srcW, tile.srcH,
-                tile.x * scaleX, tile.y * scaleY,
-                tile.w * scaleX, tile.h * scaleY
-            );
+            drawTileFrame(expCtx, img, tile, tile.x * scaleX, tile.y * scaleY, tile.w * scaleX, tile.h * scaleY);
         }
     }
 
@@ -1758,6 +1937,7 @@ function exportPng() {
 // Mode selector
 el.selectMode.addEventListener('change', () => {
     setMode(el.selectMode.value);
+    commitEdit();
 });
 
 // Play/Pause
@@ -1771,6 +1951,7 @@ el.checkSpatialShuffle.addEventListener('change', () => {
         resetSpatialShuffle();
     }
     if (!anim.playing) renderAll();
+    commitEdit();
 });
 
 el.inputSpatialAmt.addEventListener('input', () => {
@@ -1781,6 +1962,7 @@ el.inputSpatialAmt.addEventListener('input', () => {
         if (!anim.playing) renderAll();
     }
 });
+el.inputSpatialAmt.addEventListener('change', commitEdit);
 
 // Pattern
 el.selectPattern.addEventListener('change', () => {
@@ -1792,9 +1974,13 @@ el.btnPatternApply.addEventListener('click', () => {
     if (pattern === 'none') return;
     const amount = parseInt(el.inputPatternAmt.value);
     applyBlockPattern(pattern, amount);
+    commitEdit();
 });
 
-el.btnPatternClear.addEventListener('click', clearAllPins);
+el.btnPatternClear.addEventListener('click', () => {
+    clearAllPins();
+    commitEdit();
+});
 
 // Generate
 // Export
@@ -1809,6 +1995,13 @@ el.inputDuration.addEventListener('input', () => {
 // Resolution / FPS
 // FPS defines how many source frames are sampled from the range — re-extract on change
 el.selectFps.addEventListener('change', () => {
+    updateCacheInfo();
+    if (state.ready) reextractFrames();
+});
+
+// Frame quality defines the cache resolution — re-extract on change
+el.selectCache.addEventListener('change', () => {
+    updateCacheInfo();
     if (state.ready) reextractFrames();
 });
 
@@ -1822,6 +2015,7 @@ el.checkLoop.addEventListener('change', () => {
         anim.loopMode = 'hold';
         if (el.selectLoop) el.selectLoop.value = 'hold';
     }
+    commitEdit();
 });
 
 // Loop mode dropdown
@@ -1830,6 +2024,7 @@ if (el.selectLoop) {
         anim.loopMode = el.selectLoop.value;
         // Sync checkbox
         el.checkLoop.checked = anim.loopMode === 'wrap';
+        commitEdit();
     });
 }
 
@@ -1839,6 +2034,7 @@ if (el.inputStutter) {
         anim.stutter = parseInt(el.inputStutter.value, 10);
         if (el.stutterValue) el.stutterValue.innerText = anim.stutter;
     });
+    el.inputStutter.addEventListener('change', commitEdit);
 }
 
 // Grid toggle
@@ -1882,6 +2078,7 @@ async function rebuildGrid() {
     pause();
     initProject();
     renderAll();
+    commitEdit();
 }
 
 el.checkSquare.addEventListener('change', rebuildGrid);
@@ -1891,18 +2088,391 @@ el.inputRows.addEventListener('change', () => {
 });
 
 /* ==========================================================
+   PROJECT — save / open, undo / redo, autosave
+   ========================================================== */
+
+const PROJECT_VERSION = 1;
+const AUTOSAVE_KEY = 'panotile_autosave_v1';
+const HISTORY_LIMIT = 100;
+const MAX_PROJECT_FILE_BYTES = 20 * 1024 * 1024;
+
+const editHistory = { undo: [], redo: [], current: null };
+let pendingProject = null;   // project opened before its video was loaded
+let autosaveTimer = null;
+
+/** Everything needed to rebuild the edit (not the video itself). */
+function serializeProject() {
+    return {
+        app: 'PanoTile',
+        version: PROJECT_VERSION,
+        video: {
+            name: state.video.name,
+            size: state.video.size,
+            duration: state.video.duration,
+            width: state.video.width,
+            height: state.video.height,
+        },
+        range: { in: state.range.in, out: state.range.out },
+        totalFrames: state.totalFrames,
+        settings: {
+            cols: parseInt(el.inputCols.value, 10),
+            rows: parseInt(el.inputRows.value, 10),
+            square: el.checkSquare.checked,
+            fps: el.selectFps.value,
+            quality: el.selectCache.value,
+            mode: anim.mode,
+            loopMode: anim.loopMode,
+            stutter: anim.stutter,
+            spatialShuffle: el.checkSpatialShuffle.checked,
+            spatialAmt: parseInt(el.inputSpatialAmt.value, 10),
+            showGrid: el.checkGrid.checked,
+            exportRes: el.selectRes.value,
+            exportDuration: parseFloat(el.inputDuration.value),
+        },
+        tileOffsets: anim.tileOffsets.slice(),
+        tiles: state.tiles.map(t => ({
+            srcX: t.srcX,
+            srcY: t.srcY,
+            pinned: t.isPinned,
+            frame: t.frameIndex,
+            offset: t.frameOffset,
+        })),
+    };
+}
+
+const clampNum = (v, min, max, def) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : def;
+};
+const pickOption = (sel, v, def) =>
+    [...sel.options].some(o => o.value === String(v)) ? String(v) : def;
+
+/**
+ * Validate and normalise a project object. Project files are untrusted input:
+ * every field is type-checked and clamped; unknown fields are dropped.
+ */
+function parseProject(raw) {
+    if (!raw || typeof raw !== 'object' || raw.app !== 'PanoTile') {
+        throw new Error('not a PanoTile project file');
+    }
+    if (raw.version !== PROJECT_VERSION) {
+        throw new Error(`unsupported project version (${raw.version})`);
+    }
+    const st = raw.settings && typeof raw.settings === 'object' ? raw.settings : {};
+    const v = raw.video && typeof raw.video === 'object' ? raw.video : {};
+    const tilesIn = Array.isArray(raw.tiles) ? raw.tiles.slice(0, 10000) : [];
+    const maxF = MAX_SOURCE_FRAMES;
+    const rIn = clampNum(raw.range?.in, 0, 1e7, 0);
+
+    return {
+        video: {
+            name: typeof v.name === 'string' ? v.name.slice(0, 500) : '',
+            size: clampNum(v.size, 0, Number.MAX_SAFE_INTEGER, 0),
+            duration: clampNum(v.duration, 0, 1e7, 0),
+            width: Math.round(clampNum(v.width, 0, 1e5, 0)),
+            height: Math.round(clampNum(v.height, 0, 1e5, 0)),
+        },
+        range: { in: rIn, out: clampNum(raw.range?.out, rIn, 1e7, rIn) },
+        totalFrames: Math.round(clampNum(raw.totalFrames, 1, maxF, 1)),
+        settings: {
+            cols: Math.round(clampNum(st.cols, 1, 30, 4)),
+            rows: Math.round(clampNum(st.rows, 1, 100, 4)),
+            square: st.square === true,
+            fps: pickOption(el.selectFps, st.fps, el.selectFps.value),
+            quality: pickOption(el.selectCache, st.quality, 'auto'),
+            mode: pickOption(el.selectMode, st.mode, 'standard'),
+            loopMode: pickOption(el.selectLoop, st.loopMode, 'wrap'),
+            stutter: Math.round(clampNum(st.stutter, 1, 6, 1)),
+            spatialShuffle: st.spatialShuffle === true,
+            spatialAmt: Math.round(clampNum(st.spatialAmt, 0, 10, 5)),
+            showGrid: st.showGrid !== false,
+            exportRes: pickOption(el.selectRes, st.exportRes, el.selectRes.value),
+            exportDuration: clampNum(st.exportDuration, 1, MAX_EXPORT_DURATION, 5),
+        },
+        tileOffsets: (Array.isArray(raw.tileOffsets) ? raw.tileOffsets.slice(0, 10000) : [])
+            .map(o => clampNum(o, 0, 1, 0)),
+        tiles: tilesIn.map(t => ({
+            srcX: clampNum(t?.srcX, 0, 1e5, 0),
+            srcY: clampNum(t?.srcY, 0, 1e5, 0),
+            pinned: t?.pinned === true,
+            frame: Math.round(clampNum(t?.frame, 0, maxF - 1, 0)),
+            offset: Math.round(clampNum(t?.offset, -(maxF - 1), maxF - 1, 0)),
+        })),
+    };
+}
+
+/**
+ * Apply grid, animation and tile state from a parsed project to the loaded
+ * video. Range/fps/quality are NOT touched here (they need a re-extraction —
+ * see applyProjectFile); frame indices are remapped onto the current frames.
+ */
+function applyProjectState(p) {
+    const wasPlaying = anim.playing;
+    const st = p.settings;
+
+    el.inputCols.value = st.cols;
+    el.inputRows.value = st.rows;
+    el.checkSquare.checked = st.square;
+    anim.mode = st.mode;
+    el.selectMode.value = st.mode;
+    anim.loopMode = st.loopMode;
+    el.selectLoop.value = st.loopMode;
+    el.checkLoop.checked = st.loopMode === 'wrap';
+    anim.stutter = st.stutter;
+    el.inputStutter.value = st.stutter;
+    el.stutterValue.innerText = st.stutter;
+    el.checkSpatialShuffle.checked = st.spatialShuffle;
+    el.inputSpatialAmt.value = st.spatialAmt;
+    el.spatialAmtValue.innerText = st.spatialAmt;
+    el.checkGrid.checked = st.showGrid;
+    el.selectRes.value = st.exportRes;
+    el.inputDuration.value = st.exportDuration;
+    el.durationValue.innerText = st.exportDuration.toFixed(1);
+
+    initProject();   // rebuilds tiles for this grid; setMode() may auto-play
+    pause();
+
+    if (p.tiles.length === state.tiles.length) {
+        // Source crops are in source pixels — only meaningful for a same-size video
+        const sameFrameSize = p.video.width === state.video.width && p.video.height === state.video.height;
+        state.tiles.forEach((t, i) => {
+            const s = p.tiles[i];
+            if (sameFrameSize) { t.srcX = s.srcX; t.srcY = s.srcY; }
+            t.isPinned = s.pinned;
+            t.frameIndex = s.frame;
+            t.frameOffset = s.offset;
+        });
+        remapTileFrames(p.range, p.totalFrames);
+    }
+    if (p.tileOffsets.length === state.tiles.length) {
+        anim.tileOffsets = p.tileOffsets.slice();
+        anim.tilePhases = createInitialPhases();
+    }
+    anim.elapsed = 0;
+    if (wasPlaying && anim.mode !== 'standard') play();
+    rememberGrid();
+    renderAll();
+    updateStatus();
+    updateTimeline();
+}
+
+/** Apply a project file, re-extracting frames first if range/fps/quality differ. */
+async function applyProjectFile(p) {
+    const st = p.settings;
+    const dur = state.video.duration;
+    const rIn = Math.max(0, Math.min(dur - MIN_RANGE_SEC, p.range.in));
+    const rOut = Math.max(rIn + MIN_RANGE_SEC, Math.min(dur, p.range.out));
+    const needsExtract = st.fps !== el.selectFps.value
+        || st.quality !== el.selectCache.value
+        || Math.abs(rIn - state.range.in) > 1e-6
+        || Math.abs(rOut - state.range.out) > 1e-6;
+
+    if (needsExtract) {
+        el.selectFps.value = st.fps;
+        el.selectCache.value = st.quality;
+        state.range = { in: rIn, out: rOut };
+        renderRangeUI();
+        pause();
+        state.ready = false;
+        const ok = await extractFrames(state.video.probe, {
+            keepProject: true,
+            prevRange: lastExtracted && lastExtracted.range,
+        });
+        if (!ok) return false;
+    }
+    applyProjectState(p);
+    resetHistory();
+    scheduleAutosave();
+    return true;
+}
+
+async function offerApplyProject(p) {
+    const sameVideo = p.video.name === state.video.name && p.video.size === state.video.size;
+    if (!sameVideo) {
+        const ok = await confirm(
+            'Different video',
+            `This project was made for "${p.video.name || 'unknown'}". Apply it to the current video anyway?`,
+            'Apply'
+        );
+        if (!ok) return;
+    }
+    if (await applyProjectFile(p)) showToast('Project loaded', 'info');
+}
+
+/* --- Undo / redo: snapshots of the serialised project --- */
+
+function resetHistory() {
+    editHistory.undo = [];
+    editHistory.redo = [];
+    editHistory.current = state.ready ? JSON.stringify(serializeProject()) : null;
+    updateHistoryUI();
+}
+
+/** Call after every user edit; records an undo step only if something changed. */
+function commitEdit() {
+    if (!state.ready) return;
+    const snap = JSON.stringify(serializeProject());
+    if (snap === editHistory.current) return;
+    if (editHistory.current) {
+        editHistory.undo.push(editHistory.current);
+        if (editHistory.undo.length > HISTORY_LIMIT) editHistory.undo.shift();
+    }
+    editHistory.current = snap;
+    editHistory.redo = [];
+    updateHistoryUI();
+    scheduleAutosave();
+}
+
+function canStepHistory() {
+    return state.ready && !state.isExporting && !extractionRunning && !state.isDragging;
+}
+
+function undo() {
+    if (!editHistory.undo.length || !canStepHistory()) return;
+    editHistory.redo.push(editHistory.current);
+    editHistory.current = editHistory.undo.pop();
+    applyProjectState(parseProject(JSON.parse(editHistory.current)));
+    updateHistoryUI();
+    scheduleAutosave();
+}
+
+function redo() {
+    if (!editHistory.redo.length || !canStepHistory()) return;
+    editHistory.undo.push(editHistory.current);
+    editHistory.current = editHistory.redo.pop();
+    applyProjectState(parseProject(JSON.parse(editHistory.current)));
+    updateHistoryUI();
+    scheduleAutosave();
+}
+
+function updateHistoryUI() {
+    el.btnUndo.disabled = editHistory.undo.length === 0;
+    el.btnRedo.disabled = editHistory.redo.length === 0;
+}
+
+/* --- Autosave: one slot in localStorage, keyed to the video --- */
+
+function videoKey() {
+    return `${state.video.name}|${state.video.size}|${state.video.duration.toFixed(3)}`;
+}
+
+function scheduleAutosave() {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => {
+        if (!state.ready) return;
+        try {
+            localStorage.setItem(AUTOSAVE_KEY, JSON.stringify({
+                key: videoKey(),
+                savedAt: Date.now(),
+                project: serializeProject(),
+            }));
+        } catch (_) { /* storage full or blocked — autosave is best effort */ }
+    }, 800);
+}
+
+function readAutosave() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(AUTOSAVE_KEY));
+        if (raw && raw.key === videoKey()) return raw;
+    } catch (_) {}
+    return null;
+}
+
+/** Called by extractFrames when frames are in place. */
+async function onFramesReady({ fresh }) {
+    if (!fresh) {
+        // Re-extraction (range/fps/quality): not undoable, but keep earlier steps usable
+        editHistory.current = JSON.stringify(serializeProject());
+        scheduleAutosave();
+        return;
+    }
+    resetHistory();
+
+    if (pendingProject) {
+        const p = pendingProject;
+        pendingProject = null;
+        await offerApplyProject(p);
+        return;
+    }
+
+    const saved = readAutosave();
+    if (!saved) return;
+    let p;
+    try { p = parseProject(saved.project); } catch (_) { return; }
+    const when = new Date(saved.savedAt).toLocaleString();
+    const ok = await confirm('Restore session?', `Found autosaved edits for this video from ${when}.`, 'Restore');
+    if (ok && await applyProjectFile(p)) showToast('Session restored', 'info');
+}
+
+/* --- Save / open buttons --- */
+
+el.btnProjectSave.addEventListener('click', () => {
+    if (!state.ready) return;
+    const data = { ...serializeProject(), savedAt: new Date().toISOString() };
+    const base = state.video.name.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_').slice(0, 80) || 'project';
+    downloadBlob(new Blob([JSON.stringify(data)], { type: 'application/json' }), `${base}.panotile.json`);
+    showToast('Project saved', 'info');
+});
+
+el.btnProjectOpen.addEventListener('click', () => el.projectUpload.click());
+
+el.projectUpload.addEventListener('change', async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    if (f.size > MAX_PROJECT_FILE_BYTES) {
+        showToast('Project file too large');
+        return;
+    }
+    let p;
+    try {
+        p = parseProject(JSON.parse(await f.text()));
+    } catch (err) {
+        showToast(`Invalid project: ${err.message}`);
+        return;
+    }
+    if (state.isExporting || extractionRunning) {
+        showToast('Wait for the current task to finish');
+        return;
+    }
+    if (!state.ready) {
+        pendingProject = p;
+        showToast(`Project ready — now load the video "${p.video.name}"`, 'info');
+        return;
+    }
+    await offerApplyProject(p);
+});
+
+el.btnUndo.addEventListener('click', undo);
+el.btnRedo.addEventListener('click', redo);
+
+/* ==========================================================
    KEYBOARD SHORTCUTS
    ========================================================== */
 
 document.addEventListener('keydown', (e) => {
-    // Ignore if user is typing in an input
+    // Esc cancels a running extraction/export
+    if (e.key === 'Escape' && cancelHandler) {
+        cancelCurrentTask();
+        return;
+    }
+    // Ignore if user is typing in an input (native undo there)
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
-    // Leave browser/OS shortcuts alone (Cmd+S, Ctrl+R, …)
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
     // No shortcuts behind a modal, while loading or while exporting
     if ($('tutorialOverlay')?.classList.contains('visible')) return;
     if (el.confirmDialog.classList.contains('visible')) return;
     if (el.loadingOverlay.classList.contains('visible') || state.isExporting) return;
+
+    // Undo / redo: Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z, Ctrl+Y
+    const mod = e.metaKey || e.ctrlKey;
+    const k = e.key.toLowerCase();
+    if (mod && !e.altKey && (k === 'z' || k === 'y')) {
+        e.preventDefault();
+        if (k === 'y' || e.shiftKey) redo(); else undo();
+        return;
+    }
+    // Leave other browser/OS shortcuts alone (Cmd+S, Ctrl+R, …)
+    if (mod || e.altKey) return;
     // Space on a focused button should only activate that button
     if (e.key === ' ' && e.target.closest?.('button')) return;
 
@@ -1914,22 +2484,27 @@ document.addEventListener('keydown', (e) => {
         case 'l': // Linear L->R
             el.selectMode.value = 'linear-lr';
             setMode('linear-lr');
+            commitEdit();
             break;
         case 'k': // Linear R->L
             el.selectMode.value = 'linear-rl';
             setMode('linear-rl');
+            commitEdit();
             break;
         case 's': // Shuffle
             el.selectMode.value = 'temporal-shuffle';
             setMode('temporal-shuffle');
+            commitEdit();
             break;
         case 'p': // Perlin flow
             el.selectMode.value = 'perlin-flow';
             setMode('perlin-flow');
+            commitEdit();
             break;
         case 'd': // Drunk walk
             el.selectMode.value = 'drunk';
             setMode('drunk');
+            commitEdit();
             break;
         case 'r': // Reset time (pause + reset elapsed)
             pause();

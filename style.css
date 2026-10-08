@@ -1024,3 +1024,26 @@ input[type="range"].slider:disabled {
     padding: 7px 16px;
     font-size: 11px;
 }
+
+/* Frame cache estimate (RANGE section) */
+.cache-info {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-mute);
+    line-height: 1.4;
+}
+
+.cache-info.warn {
+    color: var(--pin);
+}
+
+/* Cancel button inside the loading overlay — only shown for cancellable tasks */
+.loading-cancel {
+    display: none;
+    width: auto;
+    padding: 6px 16px;
+}
+
+#loadingOverlay.cancellable .loading-cancel {
+    display: inline-flex;
+}

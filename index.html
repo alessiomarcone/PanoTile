@@ -31,10 +31,24 @@
             <div class="source-card empty" id="sourceCard">
                 <div class="source-meta" style="text-align: center;">
                     <div class="source-name" style="color: var(--text-mute);">Drop video or click</div>
-                    <div class="source-specs">MP4 · WebM · MOV · ≤200 MB</div>
+                    <div class="source-specs">MP4 · WebM · MOV · ≤4 GB</div>
                 </div>
             </div>
             <input type="file" id="videoUpload" accept="video/mp4,video/webm,video/quicktime,.mp4,.m4v,.webm,.mov" style="display: none;">
+        </div>
+
+        <!-- PROJECT -->
+        <div class="section">
+            <div class="section-title">PROJECT</div>
+            <div class="btn-grid-2">
+                <button class="btn" id="btnProjectSave" type="button" disabled>Save project</button>
+                <button class="btn" id="btnProjectOpen" type="button">Open project</button>
+            </div>
+            <input type="file" id="projectUpload" accept=".json,application/json" style="display: none;">
+            <div class="btn-grid-2">
+                <button class="btn" id="btnUndo" type="button" title="Undo (⌘Z / Ctrl+Z)" disabled>↶ Undo</button>
+                <button class="btn" id="btnRedo" type="button" title="Redo (⇧⌘Z / Ctrl+Y)" disabled>↷ Redo</button>
+            </div>
         </div>
 
         <!-- RANGE (hidden until video loaded) -->
@@ -53,6 +67,17 @@
                 <span id="rangeDur" style="color: var(--accent);">—</span>
                 <span id="rangeOut">00:00.00</span>
             </div>
+            <div class="field">
+                <div class="field-label">Frame quality</div>
+                <select class="field-select" id="selectCache">
+                    <option value="auto" selected>Auto (fits memory)</option>
+                    <option value="854">480p</option>
+                    <option value="1280">720p</option>
+                    <option value="1920">1080p</option>
+                    <option value="full">Full source</option>
+                </select>
+            </div>
+            <div class="cache-info" id="cacheInfo">—</div>
         </div>
 
         <!-- GRID -->
@@ -172,7 +197,7 @@
                     <span class="field-label">Duration</span>
                     <span class="slider-value"><span id="durationValue">5.0</span>s</span>
                 </div>
-                <input type="range" class="slider" id="inputDuration" min="1" max="60" step="0.5" value="5" disabled>
+                <input type="range" class="slider" id="inputDuration" min="1" max="300" step="0.5" value="5" disabled>
             </div>
 
             <div class="field-row">
@@ -233,6 +258,7 @@
                 <div class="progress-bar">
                     <div class="progress-fill" id="progressFill"></div>
                 </div>
+                <button class="btn loading-cancel" id="btnCancelTask" type="button">Cancel</button>
             </div>
         </div>
 
@@ -303,7 +329,7 @@
                     </div>
                     <div class="tutorial-content">
                         <h3 class="tutorial-title">1. Build Your Grid</h3>
-                        <p class="tutorial-text">Drag and drop any MP4 or WebM file (max 200MB) into the workspace. The engine will extract the frames into memory. Adjust columns and rows to define your mosaic.</p>
+                        <p class="tutorial-text">Drag and drop any MP4, WebM or MOV file (up to 4 GB) into the workspace. Frames are cached in memory at a quality that fits your device — see Frame quality under Range. Adjust columns and rows to define your mosaic.</p>
                     </div>
                 </div>
 
