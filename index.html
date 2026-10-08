@@ -12,7 +12,7 @@
     <title>PanoTile — Time-displacement video editor</title>
     <link rel="stylesheet" href="style.css">
     <!-- mp4-muxer: produces MP4 H.264 files from WebCodecs-encoded frames. -->
-    <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2"></script>
+    <script src="vendor/mp4-muxer-5.2.2.js" defer></script>
 </head>
 
 <body>
@@ -34,7 +34,7 @@
                     <div class="source-specs">MP4 · WebM · MOV · ≤200 MB</div>
                 </div>
             </div>
-            <input type="file" id="videoUpload" accept="video/mp4,video/webm,video/quicktime" style="display: none;">
+            <input type="file" id="videoUpload" accept="video/mp4,video/webm,video/quicktime,.mp4,.m4v,.webm,.mov" style="display: none;">
         </div>
 
         <!-- RANGE (hidden until video loaded) -->
@@ -116,57 +116,6 @@
                 <span class="playpause-icon" id="playpauseIcon">▶</span>
                 <span class="playpause-label" id="playpauseLabel">Play</span>
             </button>
-        </div>
-
-        <!-- BEAT ENGINE -->
-        <div class="section" id="sectionBeatEngine">
-            <div class="section-title">BEAT ENGINE</div>
-            <div class="beat-file-row">
-                <button class="btn beat-load-btn" id="btnBeatLoad">▶ Load audio</button>
-                <input type="file" id="beatFileInput" accept="audio/*" style="display:none">
-                <span class="beat-filename" id="beatFilename">no file</span>
-                <button class="btn beat-stop-btn" id="btnBeatStop" disabled>■ Stop</button>
-            </div>
-            <div class="beat-meters">
-                <div class="beat-meter-row">
-                    <span class="beat-meter-label kick">KICK</span>
-                    <div class="beat-meter-track"><div class="beat-meter-fill kick" id="meterKick"></div></div>
-                </div>
-                <div class="beat-meter-row">
-                    <span class="beat-meter-label snare">SNARE</span>
-                    <div class="beat-meter-track"><div class="beat-meter-fill snare" id="meterSnare"></div></div>
-                </div>
-                <div class="beat-meter-row">
-                    <span class="beat-meter-label lead">LEAD</span>
-                    <div class="beat-meter-track"><div class="beat-meter-fill lead" id="meterLead"></div></div>
-                </div>
-                <div class="beat-meter-row">
-                    <span class="beat-meter-label hihat">HIHAT</span>
-                    <div class="beat-meter-track"><div class="beat-meter-fill hihat" id="meterHihat"></div></div>
-                </div>
-            </div>
-            <div class="beat-divider">── Mapping ──────────────</div>
-            <div id="beatMappingUI"></div>
-            <div class="beat-divider">── Script ──────────────</div>
-            <div class="btn-grid-2">
-                <button class="btn" id="btnBeatAnalyze">Analyze</button>
-                <button class="btn" id="btnBeatExportScript" disabled>Export JSON</button>
-            </div>
-            <div class="beat-file-row">
-                <button class="btn beat-load-btn" id="btnBeatImportScript">▶ Load script</button>
-                <input type="file" id="beatScriptInput" accept=".json,application/json" style="display:none">
-                <span class="beat-filename" id="beatScriptName">no script</span>
-            </div>
-            <div class="beat-divider">── Macro ───────────────</div>
-            <div id="beatMacroUI"></div>
-            <button class="btn beat-compute-btn" id="btnBeatCompute">▶ Compute presets</button>
-            <div class="btn-grid-2">
-                <button class="btn" id="btnBeatSave">Save</button>
-                <button class="btn" id="btnBeatReset">Reset</button>
-            </div>
-            <div class="beat-warning" id="beatWarning" style="display:none">
-                ⚠ Grid changed, check beat mapping
-            </div>
         </div>
 
         <!-- SPATIAL SHUFFLE -->
